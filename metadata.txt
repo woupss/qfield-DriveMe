@@ -4,4 +4,4 @@ description=QField drive you with OSRM
 author=woupss
 icon=icon.svg
 version=0.1
-homepage=
+homepage=https://github.com/woupss/qfield-DriveMe
