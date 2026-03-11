@@ -321,7 +321,7 @@ function getHudText() {
     QfToolButton {
         id: btnNav
         iconSource: "icon.svg"
-        iconColor: isNavigating ? "green" : "white"
+        iconColor: isNavigating ? "red" : "#80cc28"
         bgcolor: Theme.darkGray
         round: true
         onClicked: { updateLayers(); dialogNav.open() }
