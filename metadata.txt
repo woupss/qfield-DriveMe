@@ -1,6 +1,6 @@
 [general]
 name=DriveMe
-description=QField drive you with OSMR
+description=QField drive you with OSRM
 author=woupss
 icon=icon.svg
 version=0.1
