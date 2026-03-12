@@ -1,4 +1,5 @@
 import QtQuick
+import QtCore
 import QtQuick.Controls
 import QtQuick.Layouts
 import Theme
@@ -10,7 +11,289 @@ Item {
     id: root
     property var mainWindow: iface.mainWindow()
     property var mapCanvas: iface.mapCanvas()
-    
+
+    // --- COULEURS CONFIGURABLES ---
+    Settings {
+        id: navColorSettings
+        category: "NavigationPluginColors"
+        property string carColor:    "cyan"
+        property string footColor:   "#FF9500"
+        property string parkColor:   "#00FF00"
+        property string targetColor: "#FF0000"
+    }
+
+    // --- COLOR WHEEL PICKER (partagé pour les 4 couleurs) ---
+    property string _editingKey: ""
+
+    Popup {
+        id: colorWheelPopup
+        parent: mainWindow.contentItem
+        modal: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        padding: 16
+        x: (parent.width  - width)  / 2
+        y: (parent.height - height) / 2
+        width: 280
+
+        background: Rectangle {
+            color: "white"; border.color: Theme.mainColor; border.width: 2; radius: 8
+        }
+
+        // --- État HSV ---
+        property real _hue: 0
+        property real _sat: 0
+        property real _val: 1
+
+        function openFor(key) {
+            root._editingKey = key
+            var hex = ""
+            if (key === "car")    hex = navColorSettings.carColor
+            if (key === "foot")   hex = navColorSettings.footColor
+            if (key === "park")   hex = navColorSettings.parkColor
+            if (key === "target") hex = navColorSettings.targetColor
+            _fromHex(hex)
+            open()
+        }
+
+        function _applyColor() {
+            var hex = _hsvToHex(_hue, _sat, _val)
+            if (root._editingKey === "car")    navColorSettings.carColor    = hex
+            if (root._editingKey === "foot")   navColorSettings.footColor   = hex
+            if (root._editingKey === "park")   navColorSettings.parkColor   = hex
+            if (root._editingKey === "target") navColorSettings.targetColor = hex
+        }
+
+        function _fromHex(hex) {
+            if (!hex || hex.toString().length < 6) return
+            var h = hex.toString()
+            if (h.charAt(0) !== '#') h = '#' + h
+            // Ignorer les octets alpha éventuels (#AARRGGBB → #RRGGBB)
+            if (h.length === 9) h = '#' + h.slice(3)
+            var r = parseInt(h.slice(1,3), 16) / 255
+            var g = parseInt(h.slice(3,5), 16) / 255
+            var b = parseInt(h.slice(5,7), 16) / 255
+            var max = Math.max(r,g,b), min = Math.min(r,g,b), d = max - min
+            _val = max; _sat = max === 0 ? 0 : d / max
+            if (d === 0) _hue = 0
+            else if (max === r) _hue = 60 * (((g-b)/d) % 6)
+            else if (max === g) _hue = 60 * ((b-r)/d + 2)
+            else _hue = 60 * ((r-g)/d + 4)
+            if (_hue < 0) _hue += 360
+            cwHexField.text = _hsvToHex(_hue, _sat, _val).toUpperCase()
+        }
+
+        function _hsvToHex(h, s, v) {
+            var r, g, b
+            var i = Math.floor(h/60) % 6
+            var f = h/60 - Math.floor(h/60)
+            var p=v*(1-s), q=v*(1-f*s), t=v*(1-(1-f)*s)
+            if      (i===0){r=v;g=t;b=p} else if(i===1){r=q;g=v;b=p}
+            else if (i===2){r=p;g=v;b=t} else if(i===3){r=p;g=q;b=v}
+            else if (i===4){r=t;g=p;b=v} else{r=v;g=p;b=q}
+            function toH(x) { return Math.round(x*255).toString(16).padStart(2,'0').toUpperCase() }
+            return '#' + toH(r) + toH(g) + toH(b)
+        }
+
+        function _updateAll() {
+            cwWheelCanvas.requestPaint()
+            cwBrightCanvas.requestPaint()
+            var hex = _hsvToHex(_hue, _sat, _val)
+            cwHexField.text = hex
+            cwPreview.color = hex
+        }
+
+        onOpened: { cwWheelCanvas.requestPaint(); cwBrightCanvas.requestPaint() }
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 12
+
+            // ── Roue HSV ──
+            Item {
+                Layout.alignment: Qt.AlignHCenter
+                width: 220; height: 220
+
+                Canvas {
+                    id: cwWheelCanvas
+                    width: 220; height: 220
+                    readonly property real cx: 110
+                    readonly property real cy: 110
+                    readonly property real radius: 108
+
+                    function hsvToRgb(h, s, v) {
+                        var r,g,b, i=Math.floor(h/60)%6, f=h/60-Math.floor(h/60)
+                        var p=v*(1-s),q=v*(1-f*s),t=v*(1-(1-f)*s)
+                        if(i===0){r=v;g=t;b=p}else if(i===1){r=q;g=v;b=p}
+                        else if(i===2){r=p;g=v;b=t}else if(i===3){r=p;g=q;b=v}
+                        else if(i===4){r=t;g=p;b=v}else{r=v;g=p;b=q}
+                        return [Math.round(r*255),Math.round(g*255),Math.round(b*255)]
+                    }
+
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        ctx.save()
+                        ctx.beginPath()
+                        ctx.arc(cx, cy, radius, 0, Math.PI*2)
+                        ctx.clip()
+                        for (var angle = 0; angle < 360; angle++) {
+                            var sa = (angle-1)*Math.PI/180, ea = (angle+1)*Math.PI/180
+                            var rgb = hsvToRgb(angle, 1, colorWheelPopup._val)
+                            var grad = ctx.createRadialGradient(cx,cy,0,cx,cy,radius)
+                            grad.addColorStop(0, "rgba(255,255,255,"+colorWheelPopup._val+")")
+                            grad.addColorStop(1, "rgba("+rgb[0]+","+rgb[1]+","+rgb[2]+",1)")
+                            ctx.beginPath(); ctx.moveTo(cx,cy)
+                            ctx.arc(cx,cy,radius,sa,ea); ctx.closePath()
+                            ctx.fillStyle = grad; ctx.fill()
+                        }
+                        ctx.restore()
+                        ctx.beginPath(); ctx.arc(cx,cy,radius,0,Math.PI*2)
+                        ctx.strokeStyle="#555"; ctx.lineWidth=1.5; ctx.stroke()
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onPressed:         _handle(mouseX, mouseY)
+                        onPositionChanged: if (pressed) _handle(mouseX, mouseY)
+                        function _handle(mx, my) {
+                            var dx=mx-cwWheelCanvas.cx, dy=my-cwWheelCanvas.cy
+                            var dist=Math.sqrt(dx*dx+dy*dy)
+                            if (dist > cwWheelCanvas.radius) return
+                            colorWheelPopup._hue = ((Math.atan2(dy,dx)*180/Math.PI)+360)%360
+                            colorWheelPopup._sat = Math.min(1, dist/cwWheelCanvas.radius)
+                            colorWheelPopup._updateAll()
+                        }
+                    }
+                }
+
+                // Curseur roue
+                Rectangle {
+                    property real rad: colorWheelPopup._hue * Math.PI / 180
+                    property real d:   colorWheelPopup._sat * cwWheelCanvas.radius
+                    x: cwWheelCanvas.cx + d * Math.cos(rad) - 9
+                    y: cwWheelCanvas.cy + d * Math.sin(rad) - 9
+                    width: 18; height: 18; radius: 9
+                    color: cwPreview.color
+                    border.color: "white"; border.width: 2.5
+                    antialiasing: true
+                }
+            }
+
+            // ── Barre de luminosité ──
+            Item {
+                Layout.fillWidth: true
+                height: 22
+
+                Canvas {
+                    id: cwBrightCanvas
+                    anchors.fill: parent
+
+                    function hsvToRgb(h, s, v) {
+                        var r,g,b, i=Math.floor(h/60)%6, f=h/60-Math.floor(h/60)
+                        var p=v*(1-s),q=v*(1-f*s),t=v*(1-(1-f)*s)
+                        if(i===0){r=v;g=t;b=p}else if(i===1){r=q;g=v;b=p}
+                        else if(i===2){r=p;g=v;b=t}else if(i===3){r=p;g=q;b=v}
+                        else if(i===4){r=t;g=p;b=v}else{r=v;g=p;b=q}
+                        return [Math.round(r*255),Math.round(g*255),Math.round(b*255)]
+                    }
+
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0,0,width,height)
+                        var rgb = hsvToRgb(colorWheelPopup._hue, colorWheelPopup._sat, 1)
+                        var grad = ctx.createLinearGradient(0,0,width,0)
+                        grad.addColorStop(0, "#000000")
+                        grad.addColorStop(1, "rgb("+rgb[0]+","+rgb[1]+","+rgb[2]+")")
+                        var rr = height/2
+                        ctx.beginPath()
+                        ctx.moveTo(rr,0); ctx.lineTo(width-rr,0)
+                        ctx.arc(width-rr,rr,rr,-Math.PI/2,Math.PI/2)
+                        ctx.lineTo(rr,height)
+                        ctx.arc(rr,rr,rr,Math.PI/2,-Math.PI/2)
+                        ctx.closePath()
+                        ctx.fillStyle=grad; ctx.fill()
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onPressed:         _handle(mouseX)
+                        onPositionChanged: if (pressed) _handle(mouseX)
+                        function _handle(mx) {
+                            colorWheelPopup._val = Math.max(0, Math.min(1, mx/width))
+                            colorWheelPopup._updateAll()
+                        }
+                    }
+                }
+
+                // Curseur luminosité
+                Rectangle {
+                    x: colorWheelPopup._val * parent.width - 5
+                    y: parent.height/2 - 14
+                    width: 10; height: 28; radius: 4
+                    color: "transparent"
+                    border.color: "white"; border.width: 2
+                }
+            }
+
+            // ── Aperçu + hex ──
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Rectangle {
+                    id: cwPreview
+                    width: 44; height: 44; radius: 22
+                    color: "#FF0000"
+                    border.color: "#aaa"; border.width: 2
+                    antialiasing: true
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 3
+                    Label { text: "Code couleur"; font.pixelSize: 10; color: "#888" }
+                    TextField {
+                        id: cwHexField
+                        Layout.fillWidth: true
+                        text: "#FF0000"
+                        maximumLength: 7
+                        font.pixelSize: 14
+                        leftPadding: 8
+                        background: Rectangle {
+                            color: "#f5f5f5"
+                            border.color: cwHexField.activeFocus ? Theme.mainColor : "#ccc"
+                            border.width: 1; radius: 6
+                        }
+                        color: "#333"
+                        onAccepted: {
+                            var v = text.trim()
+                            if (v.charAt(0) !== '#') v = '#' + v
+                            if (v.length === 7) { colorWheelPopup._fromHex(v); colorWheelPopup._updateAll() }
+                        }
+                    }
+                }
+            }
+
+            // ── Boutons ──
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                Button {
+                    text: "Annuler"; Layout.fillWidth: true
+                    background: Rectangle { color: parent.down ? "#ddd" : "#eee"; radius: 6; border.color: "#ccc"; border.width: 1 }
+                    contentItem: Text { text: parent.text; color: "#333"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    onClicked: colorWheelPopup.close()
+                }
+                Button {
+                    text: "OK"; Layout.fillWidth: true
+                    background: Rectangle { color: parent.down ? Qt.darker(Theme.mainColor,1.2) : Theme.mainColor; radius: 6 }
+                    contentItem: Text { text: parent.text; color: "white"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    onClicked: { colorWheelPopup._applyColor(); colorWheelPopup.close() }
+                }
+            }
+        }
+    }
+
     // --- VARIABLES ---
     property var unvisitedPoints: []   
     property var currentTarget: null   
@@ -47,7 +330,7 @@ Item {
         "RESTANT":                          { "fr": "RESTANT",                          "en": "REMAINING" },
         "DISTANCE":                         { "fr": "DISTANCE",                         "en": "DISTANCE" },
         "NAVIGATION":                       { "fr": "NAVIGATION",                       "en": "NAVIGATION" },
-        "Couche:":                          { "fr": "Couche :",                         "en": "Layer:" },
+        "Vers les géométries de la couche :":                          { "fr": "Vers les géométries de la couche :",                         "en": "Towards the geometries of layer :" },
         "ARRÊTER":                          { "fr": "ARRÊTER",                          "en": "STOP" },
         "DÉMARRER":                         { "fr": "DÉMARRER",                         "en": "START" },
         "Aucun élément trouvé":             { "fr": "Aucun élément trouvé",             "en": "No features found" },
@@ -84,8 +367,8 @@ Item {
         mapSettings: mapCanvas.mapSettings
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 6
-        color: "cyan" // cyan
-        opacity: 0.8
+        color: navColorSettings.carColor
+        opacity: 0.9
     }
 
     QFieldItems.GeometryRenderer {
@@ -94,7 +377,7 @@ Item {
         mapSettings: mapCanvas.mapSettings
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 5
-        color: "#FF9500" // Orange
+        color: navColorSettings.footColor
         opacity: 0.9
     }
 
@@ -104,7 +387,7 @@ Item {
         mapSettings: mapCanvas.mapSettings
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 14
-        color: "#FF0000" // Rouge — points rouges clignotants sur les points on-route
+        color: navColorSettings.targetColor // Rouge — points cibles clignotants
         opacity: 0.9
         SequentialAnimation on opacity {
             loops: Animation.Infinite
@@ -159,9 +442,9 @@ Item {
         x: targetScreenPos.screenPoint.x - width / 2
         y: targetScreenPos.screenPoint.y - height / 2
         width: 50; height: 50
-        Rectangle { anchors.centerIn: parent; width: 16; height: 16; radius: 8; color: "#FF0000"; border.color: "white"; border.width: 2 }
+        Rectangle { anchors.centerIn: parent; width: 16; height: 16; radius: 8; color: navColorSettings.targetColor; border.color: "white"; border.width: 2 }
         Rectangle {
-            anchors.centerIn: parent; width: parent.width; height: parent.height; radius: width / 2; color: "transparent"; border.color: "#FF0000"; border.width: 3
+            anchors.centerIn: parent; width: parent.width; height: parent.height; radius: width / 2; color: "transparent"; border.color: navColorSettings.targetColor; border.width: 3
             SequentialAnimation on scale { loops: Animation.Infinite; running: blinkingTarget.visible; NumberAnimation { from: 0.2; to: 1.0; duration: 1200; easing.type: Easing.OutQuad } }
             SequentialAnimation on opacity { loops: Animation.Infinite; running: blinkingTarget.visible; NumberAnimation { from: 1.0; to: 0.0; duration: 1200; easing.type: Easing.OutQuad } }
         }
@@ -185,9 +468,9 @@ Item {
         x: carScreenPos.screenPoint.x - width / 2
         y: carScreenPos.screenPoint.y - height / 2
         width: 60; height: 60
-        Rectangle { anchors.centerIn: parent; width: 20; height: 20; radius: 10; color: "#00FF00"; border.color: "black"; border.width: 3 }
+        Rectangle { anchors.centerIn: parent; width: 20; height: 20; radius: 10; color: navColorSettings.parkColor; border.color: "black"; border.width: 3 }
         Rectangle {
-            anchors.centerIn: parent; width: parent.width; height: parent.height; radius: width / 2; color: "transparent"; border.color: "#00FF00"; border.width: 4
+            anchors.centerIn: parent; width: parent.width; height: parent.height; radius: width / 2; color: "transparent"; border.color: navColorSettings.parkColor; border.width: 4
             SequentialAnimation on scale { loops: Animation.Infinite; running: blinkingCar.visible; NumberAnimation { from: 0.3; to: 1.0; duration: 1500; easing.type: Easing.OutQuad } }
             SequentialAnimation on opacity { loops: Animation.Infinite; running: blinkingCar.visible; NumberAnimation { from: 1.0; to: 0.0; duration: 1500; easing.type: Easing.OutQuad } }
         }
@@ -329,13 +612,20 @@ function getHudText() {
 
     // --- 6. DIALOGUE ---
     Dialog {
-        id: dialogNav
-        parent: mainWindow.contentItem
-        modal: true
-        width: Math.min(mainWindow.width * 0.8, 450)
-        x: (mainWindow.width - width) / 2
-        y: (mainWindow.height - height) / 4
-        background: Rectangle { color: "white"; border.color: Theme.mainColor; border.width: 2; radius: 8 }
+    id: dialogNav
+    parent: mainWindow.contentItem
+    modal: true
+    width: Math.min(mainWindow.width * 0.8, 450)
+    x: (mainWindow.width - width) / 2
+    y: (mainWindow.height - height) / 2
+    background: Rectangle { color: "white"; border.color: Theme.mainColor; border.width: 2; radius: 8 }
+
+    property bool isLandscape: mainWindow.width > mainWindow.height
+    property real scaleFactor: isLandscape
+        ? Math.min(1.0, mainWindow.height * 0.92 / Math.max(implicitHeight, 1))
+        : 1.0
+
+    scale: scaleFactor
 
         contentItem: ColumnLayout {
             spacing: 0
@@ -343,7 +633,7 @@ function getHudText() {
             // Titre — intégré dans contentItem pour que la bordure du background fasse tout le tour
             Rectangle {
                 Layout.fillWidth: true
-                implicitHeight: titleLabel.implicitHeight + 12
+                implicitHeight: titleLabel.implicitHeight + 5
                 color: "white"
                 radius: 8
                 // Supprime les coins ronds du bas pour raccorder proprement au contenu blanc
@@ -363,9 +653,91 @@ function getHudText() {
             ColumnLayout {
             spacing: 15
             Layout.fillWidth: true
-            Layout.margins: 12
-            Label { text: tr("Couche:") }
+            Layout.topMargin: 12
+            Layout.leftMargin: 12
+            Layout.rightMargin: 12
+            Layout.bottomMargin: 6
+            Label { text: tr("Vers les géométries de la couche :") }
             QfComboBox { id: layerSelector; Layout.fillWidth: true; model:[]; enabled: !isNavigating }
+
+            // --- COULEURS ---
+            
+            
+            Label {
+                text: "🎨 Couleurs des tracés"
+                font.bold: true
+                font.pixelSize: 13
+                color: Theme.mainColor
+            }
+
+            // Ligne de couleur réutilisable via GridLayout
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 2
+                columnSpacing: 8
+                rowSpacing: 8
+
+                // --- Tracé voiture ---
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 52
+                    color: "#259E9E9E"
+                    border.color: Theme.controlBorderColor; border.width: 1; radius: 6
+                    MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("car") }
+                    RowLayout {
+                        anchors.fill: parent; anchors.margins: 6; spacing: 6
+                        Rectangle { width: 20; height: 20; radius: 4; color: navColorSettings.carColor; border.color: "gray"; border.width: 1 }
+                        Label { text: "Tracé voiture"; font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                       // Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
+                    }
+                }
+
+                // --- Tracé piéton ---
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 52
+                    color: "#259E9E9E"
+                    border.color: Theme.controlBorderColor; border.width: 1; radius: 6
+                    MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("foot") }
+                    RowLayout {
+                        anchors.fill: parent; anchors.margins: 6; spacing: 6
+                        Rectangle { width: 20; height: 20; radius: 4; color: navColorSettings.footColor; border.color: "gray"; border.width: 1 }
+                        Label { text: "Tracé piéton"; font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                     //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
+                    }
+                }
+
+                // --- Point de stationnement ---
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 52
+                    color: "#259E9E9E"
+                    border.color: Theme.controlBorderColor; border.width: 1; radius: 6
+                    MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("park") }
+                    RowLayout {
+                        anchors.fill: parent; anchors.margins: 6; spacing: 6
+                        Rectangle { width: 20; height: 20; radius: 10; color: navColorSettings.parkColor; border.color: "gray"; border.width: 1 }
+                        Label { text: "Stationnement"; font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                     //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
+                    }
+                }
+
+                // --- Points cibles ---
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 52
+                    color: "#259E9E9E"
+                    border.color: Theme.controlBorderColor; border.width: 1; radius: 6
+                    MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("target") }
+                    RowLayout {
+                        anchors.fill: parent; anchors.margins: 6; spacing: 6
+                        Rectangle { width: 20; height: 20; radius: 10; color: navColorSettings.targetColor; border.color: "gray"; border.width: 1 }
+                        Label { text: "Points cibles"; font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                     //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
+                    }
+                }
+            }
+            // --- FIN COULEURS ---
 
           //  Label { text: "2. Max walking distance:" }
         //    QfComboBox {
