@@ -3,5 +3,5 @@ name=DriveMe
 description=QField drive you with OSRM
 author=woupss
 icon=icon.svg
-version=0.2
+version=0.3
 homepage=https://github.com/woupss/qfield-DriveMe

@@ -30,7 +30,7 @@ Item {
         parent: mainWindow.contentItem
         modal: true
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-        padding: 16
+        padding: 0
         x: (parent.width  - width)  / 2
         y: (parent.height - height) / 2
         width: 280
@@ -52,6 +52,7 @@ Item {
             if (key === "park")   hex = navColorSettings.parkColor
             if (key === "target") hex = navColorSettings.targetColor
             _fromHex(hex)
+            _updateAll()
             open()
         }
 
@@ -102,23 +103,34 @@ Item {
             cwPreview.color = hex
         }
 
-        onOpened: { cwWheelCanvas.requestPaint(); cwBrightCanvas.requestPaint() }
+        onOpened: _updateAll()
 
         ColumnLayout {
-            width: parent.width
-            spacing: 12
+            id: cwMainCol
+            width: 280
+            spacing: 0
 
-            // ── Roue HSV ──
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 12
+                Layout.leftMargin: 12
+                Layout.rightMargin: 12
+                Layout.bottomMargin: 12
+                spacing: 10
+
+            // ── Roue QGIS : couronne hue + triangle S/V ──
             Item {
                 Layout.alignment: Qt.AlignHCenter
-                width: 220; height: 220
+                width: 240; height: 240
 
                 Canvas {
                     id: cwWheelCanvas
-                    width: 220; height: 220
-                    readonly property real cx: 110
-                    readonly property real cy: 110
-                    readonly property real radius: 108
+                    width: 240; height: 240
+                    readonly property real cx:      120
+                    readonly property real cy:      120
+                    readonly property real outerR:  116
+                    readonly property real innerR:  96
+                    readonly property real ringMid: (outerR + innerR) / 2
 
                     function hsvToRgb(h, s, v) {
                         var r,g,b, i=Math.floor(h/60)%6, f=h/60-Math.floor(h/60)
@@ -129,26 +141,61 @@ Item {
                         return [Math.round(r*255),Math.round(g*255),Math.round(b*255)]
                     }
 
+                    function triVerts() {
+                        var h0 = colorWheelPopup._hue * Math.PI / 180
+                        var h1 = h0 + 2*Math.PI/3
+                        var h2 = h0 + 4*Math.PI/3
+                        return [
+                            { x: cx + innerR*Math.cos(h0), y: cy + innerR*Math.sin(h0) },
+                            { x: cx + innerR*Math.cos(h1), y: cy + innerR*Math.sin(h1) },
+                            { x: cx + innerR*Math.cos(h2), y: cy + innerR*Math.sin(h2) }
+                        ]
+                    }
+
                     onPaint: {
                         var ctx = getContext("2d")
                         ctx.clearRect(0, 0, width, height)
-                        ctx.save()
-                        ctx.beginPath()
-                        ctx.arc(cx, cy, radius, 0, Math.PI*2)
-                        ctx.clip()
+
+                        // ── Couronne hue ──
                         for (var angle = 0; angle < 360; angle++) {
-                            var sa = (angle-1)*Math.PI/180, ea = (angle+1)*Math.PI/180
-                            var rgb = hsvToRgb(angle, 1, colorWheelPopup._val)
-                            var grad = ctx.createRadialGradient(cx,cy,0,cx,cy,radius)
-                            grad.addColorStop(0, "rgba(255,255,255,"+colorWheelPopup._val+")")
-                            grad.addColorStop(1, "rgba("+rgb[0]+","+rgb[1]+","+rgb[2]+",1)")
-                            ctx.beginPath(); ctx.moveTo(cx,cy)
-                            ctx.arc(cx,cy,radius,sa,ea); ctx.closePath()
-                            ctx.fillStyle = grad; ctx.fill()
+                            var sa = (angle - 0.5) * Math.PI / 180
+                            var ea = (angle + 1.5) * Math.PI / 180
+                            var rgb = hsvToRgb(angle, 1, 1)
+                            ctx.beginPath()
+                            ctx.moveTo(cx + innerR*Math.cos(sa), cy + innerR*Math.sin(sa))
+                            ctx.arc(cx, cy, outerR, sa, ea)
+                            ctx.arc(cx, cy, innerR, ea, sa, true)
+                            ctx.closePath()
+                            ctx.fillStyle = "rgb("+rgb[0]+","+rgb[1]+","+rgb[2]+")"
+                            ctx.fill()
                         }
-                        ctx.restore()
-                        ctx.beginPath(); ctx.arc(cx,cy,radius,0,Math.PI*2)
-                        ctx.strokeStyle="#555"; ctx.lineWidth=1.5; ctx.stroke()
+                        ctx.beginPath(); ctx.arc(cx,cy,outerR,0,Math.PI*2)
+                        ctx.strokeStyle="#777"; ctx.lineWidth=1; ctx.stroke()
+                        ctx.beginPath(); ctx.arc(cx,cy,innerR,0,Math.PI*2)
+                        ctx.strokeStyle="#777"; ctx.lineWidth=1; ctx.stroke()
+
+                        // ── Triangle intérieur ──
+                        var vt = triVerts()
+                        var t0=vt[0], t1=vt[1], t2=vt[2]
+                        function triPath() {
+                            ctx.beginPath()
+                            ctx.moveTo(t0.x,t0.y); ctx.lineTo(t1.x,t1.y)
+                            ctx.lineTo(t2.x,t2.y); ctx.closePath()
+                        }
+                        var rgb0 = hsvToRgb(colorWheelPopup._hue, 1, 1)
+                        triPath(); ctx.fillStyle="rgb("+rgb0[0]+","+rgb0[1]+","+rgb0[2]+")"; ctx.fill()
+
+                        var mid01x=(t0.x+t2.x)/2, mid01y=(t0.y+t2.y)/2
+                        var gw = ctx.createLinearGradient(t1.x,t1.y, mid01x,mid01y)
+                        gw.addColorStop(0,"rgba(255,255,255,1)"); gw.addColorStop(1,"rgba(255,255,255,0)")
+                        triPath(); ctx.fillStyle=gw; ctx.fill()
+
+                        var mid02x=(t0.x+t1.x)/2, mid02y=(t0.y+t1.y)/2
+                        var gb = ctx.createLinearGradient(t2.x,t2.y, mid02x,mid02y)
+                        gb.addColorStop(0,"rgba(0,0,0,1)"); gb.addColorStop(1,"rgba(0,0,0,0)")
+                        triPath(); ctx.fillStyle=gb; ctx.fill()
+
+                        triPath(); ctx.strokeStyle="rgba(0,0,0,0.25)"; ctx.lineWidth=1; ctx.stroke()
                     }
 
                     MouseArea {
@@ -158,88 +205,62 @@ Item {
                         function _handle(mx, my) {
                             var dx=mx-cwWheelCanvas.cx, dy=my-cwWheelCanvas.cy
                             var dist=Math.sqrt(dx*dx+dy*dy)
-                            if (dist > cwWheelCanvas.radius) return
-                            colorWheelPopup._hue = ((Math.atan2(dy,dx)*180/Math.PI)+360)%360
-                            colorWheelPopup._sat = Math.min(1, dist/cwWheelCanvas.radius)
-                            colorWheelPopup._updateAll()
+                            if (dist >= cwWheelCanvas.innerR && dist <= cwWheelCanvas.outerR) {
+                                colorWheelPopup._hue = ((Math.atan2(dy,dx)*180/Math.PI)+360)%360
+                                colorWheelPopup._updateAll(); return
+                            }
+                            if (dist < cwWheelCanvas.innerR) {
+                                var vt = cwWheelCanvas.triVerts()
+                                var t0=vt[0], t1=vt[1], t2=vt[2]
+                                var denom = (t1.y-t2.y)*(t0.x-t2.x) + (t2.x-t1.x)*(t0.y-t2.y)
+                                if (Math.abs(denom) < 0.001) return
+                                var a = ((t1.y-t2.y)*(mx-t2.x) + (t2.x-t1.x)*(my-t2.y)) / denom
+                                var b = ((t2.y-t0.y)*(mx-t2.x) + (t0.x-t2.x)*(my-t2.y)) / denom
+                                var c = 1-a-b
+                                a=Math.max(0,a); b=Math.max(0,b); c=Math.max(0,c)
+                                var sum=a+b+c; a/=sum; b/=sum; c/=sum
+                                var newV = a+b
+                                colorWheelPopup._val = Math.max(0, Math.min(1, newV))
+                                colorWheelPopup._sat = Math.max(0, Math.min(1, newV > 0.001 ? a/newV : 0))
+                                colorWheelPopup._updateAll()
+                            }
                         }
                     }
                 }
 
-                // Curseur roue
+                // Curseur couronne
                 Rectangle {
                     property real rad: colorWheelPopup._hue * Math.PI / 180
-                    property real d:   colorWheelPopup._sat * cwWheelCanvas.radius
-                    x: cwWheelCanvas.cx + d * Math.cos(rad) - 9
-                    y: cwWheelCanvas.cy + d * Math.sin(rad) - 9
-                    width: 18; height: 18; radius: 9
+                    x: cwWheelCanvas.cx + cwWheelCanvas.ringMid * Math.cos(rad) - 8
+                    y: cwWheelCanvas.cy + cwWheelCanvas.ringMid * Math.sin(rad) - 8
+                    width: 16; height: 16; radius: 8
+                    color: "transparent"
+                    border.color: "white"; border.width: 2.5
+                    antialiasing: true
+                }
+
+                // Curseur triangle
+                Rectangle {
+                    property var verts: cwWheelCanvas.triVerts()
+                    property var p0: verts[0]; property var p1: verts[1]; property var p2: verts[2]
+                    property real sv: colorWheelPopup._sat
+                    property real vv: colorWheelPopup._val
+                    property real px: vv*(sv*p0.x + (1-sv)*p1.x) + (1-vv)*p2.x
+                    property real py: vv*(sv*p0.y + (1-sv)*p1.y) + (1-vv)*p2.y
+                    x: px - 8; y: py - 8
+                    width: 16; height: 16; radius: 8
                     color: cwPreview.color
                     border.color: "white"; border.width: 2.5
                     antialiasing: true
                 }
             }
 
-            // ── Barre de luminosité ──
-            Item {
-                Layout.fillWidth: true
-                height: 22
-
-                Canvas {
-                    id: cwBrightCanvas
-                    anchors.fill: parent
-
-                    function hsvToRgb(h, s, v) {
-                        var r,g,b, i=Math.floor(h/60)%6, f=h/60-Math.floor(h/60)
-                        var p=v*(1-s),q=v*(1-f*s),t=v*(1-(1-f)*s)
-                        if(i===0){r=v;g=t;b=p}else if(i===1){r=q;g=v;b=p}
-                        else if(i===2){r=p;g=v;b=t}else if(i===3){r=p;g=q;b=v}
-                        else if(i===4){r=t;g=p;b=v}else{r=v;g=p;b=q}
-                        return [Math.round(r*255),Math.round(g*255),Math.round(b*255)]
-                    }
-
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.clearRect(0,0,width,height)
-                        var rgb = hsvToRgb(colorWheelPopup._hue, colorWheelPopup._sat, 1)
-                        var grad = ctx.createLinearGradient(0,0,width,0)
-                        grad.addColorStop(0, "#000000")
-                        grad.addColorStop(1, "rgb("+rgb[0]+","+rgb[1]+","+rgb[2]+")")
-                        var rr = height/2
-                        ctx.beginPath()
-                        ctx.moveTo(rr,0); ctx.lineTo(width-rr,0)
-                        ctx.arc(width-rr,rr,rr,-Math.PI/2,Math.PI/2)
-                        ctx.lineTo(rr,height)
-                        ctx.arc(rr,rr,rr,Math.PI/2,-Math.PI/2)
-                        ctx.closePath()
-                        ctx.fillStyle=grad; ctx.fill()
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        onPressed:         _handle(mouseX)
-                        onPositionChanged: if (pressed) _handle(mouseX)
-                        function _handle(mx) {
-                            colorWheelPopup._val = Math.max(0, Math.min(1, mx/width))
-                            colorWheelPopup._updateAll()
-                        }
-                    }
-                }
-
-                // Curseur luminosité
-                Rectangle {
-                    x: colorWheelPopup._val * parent.width - 5
-                    y: parent.height/2 - 14
-                    width: 10; height: 28; radius: 4
-                    color: "transparent"
-                    border.color: "white"; border.width: 2
-                }
-            }
+            Canvas { id: cwBrightCanvas; width:1; height:1; visible:false; onPaint:{} }
 
             // ── Aperçu + hex ──
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 10
-
                 Rectangle {
                     id: cwPreview
                     width: 44; height: 44; radius: 22
@@ -247,11 +268,10 @@ Item {
                     border.color: "#aaa"; border.width: 2
                     antialiasing: true
                 }
-
                 ColumnLayout {
                     Layout.fillWidth: true
                     spacing: 3
-                    Label { text: "Code couleur"; font.pixelSize: 10; color: "#888" }
+                    Label { text: tr("Code couleur"); font.pixelSize: 10; color: "#888" }
                     TextField {
                         id: cwHexField
                         Layout.fillWidth: true
@@ -279,7 +299,7 @@ Item {
                 Layout.fillWidth: true
                 spacing: 10
                 Button {
-                    text: "Annuler"; Layout.fillWidth: true
+                    text: tr("Annuler"); Layout.fillWidth: true
                     background: Rectangle { color: parent.down ? "#ddd" : "#eee"; radius: 6; border.color: "#ccc"; border.width: 1 }
                     contentItem: Text { text: parent.text; color: "#333"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     onClicked: colorWheelPopup.close()
@@ -291,7 +311,9 @@ Item {
                     onClicked: { colorWheelPopup._applyColor(); colorWheelPopup.close() }
                 }
             }
-        }
+
+            }   // ColumnLayout inner
+        }   // ColumnLayout cwMainCol
     }
 
     // --- VARIABLES ---
@@ -330,10 +352,17 @@ Item {
         "RESTANT":                          { "fr": "RESTANT",                          "en": "REMAINING" },
         "DISTANCE":                         { "fr": "DISTANCE",                         "en": "DISTANCE" },
         "NAVIGATION":                       { "fr": "NAVIGATION",                       "en": "NAVIGATION" },
-        "Vers les géométries de la couche :":                          { "fr": "Vers les géométries de la couche :",                         "en": "Towards the geometries of layer :" },
+        "Couche:":                          { "fr": "Couche :",                         "en": "Layer:" },
         "ARRÊTER":                          { "fr": "ARRÊTER",                          "en": "STOP" },
         "DÉMARRER":                         { "fr": "DÉMARRER",                         "en": "START" },
         "Aucun élément trouvé":             { "fr": "Aucun élément trouvé",             "en": "No features found" },
+        "Vers les géométries de la couche :":                          { "fr": "Vers les géométries de la couche :",                         "en": "Towards the geometries of layer :" },
+       "Code couleur":             { "fr": "Code couleur",             "en": "Color code" },
+        "Tracé voiture":             { "fr": "Tracé voiture",             "en": "Car route" },
+        "Tracé piéton":             { "fr": "Tracé piéton",                    "en": "Walk route" },
+        "Stationnement":             { "fr": "Stationnement",                    "en": "Parking" },
+        "Points cibles":             { "fr": "Points cibles",                    "en": "Target points" },
+        "Annuler":                        { "fr": "Annuler",                        "en": "Cancel" },
         "Aucun point trouvé":               { "fr": "Aucun point trouvé",               "en": "No points found" },
         "✅ Cible atteinte !":              { "fr": "✅ Cible atteinte !",              "en": "✅ Target reached!" },
         "✅ Point validé\nau passage !":   { "fr": "✅ Point validé\nau passage !",   "en": "✅ Point validated\non the way!" },
@@ -368,7 +397,7 @@ Item {
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 6
         color: navColorSettings.carColor
-        opacity: 0.9
+        opacity: 0.8
     }
 
     QFieldItems.GeometryRenderer {
@@ -660,15 +689,7 @@ function getHudText() {
             Label { text: tr("Vers les géométries de la couche :") }
             QfComboBox { id: layerSelector; Layout.fillWidth: true; model:[]; enabled: !isNavigating }
 
-            // --- COULEURS ---
-            
-            
-            Label {
-                text: "🎨 Couleurs des tracés"
-                font.bold: true
-                font.pixelSize: 13
-                color: Theme.mainColor
-            }
+            // --- COULEURS ---  
 
             // Ligne de couleur réutilisable via GridLayout
             GridLayout {
@@ -687,7 +708,7 @@ function getHudText() {
                     RowLayout {
                         anchors.fill: parent; anchors.margins: 6; spacing: 6
                         Rectangle { width: 20; height: 20; radius: 4; color: navColorSettings.carColor; border.color: "gray"; border.width: 1 }
-                        Label { text: "Tracé voiture"; font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                        Label { text: tr("Tracé voiture"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
                        // Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
                     }
                 }
@@ -702,7 +723,7 @@ function getHudText() {
                     RowLayout {
                         anchors.fill: parent; anchors.margins: 6; spacing: 6
                         Rectangle { width: 20; height: 20; radius: 4; color: navColorSettings.footColor; border.color: "gray"; border.width: 1 }
-                        Label { text: "Tracé piéton"; font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                        Label { text: tr("Tracé piéton"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
                      //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
                     }
                 }
@@ -717,7 +738,7 @@ function getHudText() {
                     RowLayout {
                         anchors.fill: parent; anchors.margins: 6; spacing: 6
                         Rectangle { width: 20; height: 20; radius: 10; color: navColorSettings.parkColor; border.color: "gray"; border.width: 1 }
-                        Label { text: "Stationnement"; font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                        Label { text: tr("Stationnement"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
                      //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
                     }
                 }
@@ -732,7 +753,7 @@ function getHudText() {
                     RowLayout {
                         anchors.fill: parent; anchors.margins: 6; spacing: 6
                         Rectangle { width: 20; height: 20; radius: 10; color: navColorSettings.targetColor; border.color: "gray"; border.width: 1 }
-                        Label { text: "Points cibles"; font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                        Label { text: tr("Points cibles"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
                      //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
                     }
                 }
@@ -815,7 +836,7 @@ function getHudText() {
         polygonCenters = {}
         traveledCoords = []
 
-      //  iface.logMessage("Arrêt.", Qgis.Info)
+        iface.logMessage("Arrêt.", Qgis.Info)
         mapCanvas.refresh()
     }
 
@@ -866,7 +887,7 @@ function getHudText() {
             }
 
         } catch(e) {
-          //  iface.logMessage("Erreur startNav: " + e.toString(), Qgis.Critical)
+            iface.logMessage("Erreur startNav: " + e.toString(), Qgis.Critical)
         }
     }
 
@@ -1076,7 +1097,7 @@ function getHudText() {
             optimizeEntireTour(startPos)
         }
         
-     //   iface.logMessage("Nav démarrée.", Qgis.Info)
+        iface.logMessage("Nav démarrée.", Qgis.Info)
         updateNavigationLoop()
     }
 
@@ -1101,7 +1122,7 @@ function getHudText() {
                         if (newOrder.length === unvisitedPoints.length) {
                             unvisitedPoints = newOrder
                             currentTarget = unvisitedPoints[0]
-                            // iface.logMessage("Tournée optimisée par OSRM.", Qgis.Success)
+                            iface.logMessage("Tournée optimisée par OSRM.", Qgis.Success)
                         }
                     }
                 } catch(e) {}
