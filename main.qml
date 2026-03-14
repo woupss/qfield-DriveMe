@@ -815,7 +815,7 @@ function getHudText() {
         polygonCenters = {}
         traveledCoords = []
 
-        iface.logMessage("Arrêt.", Qgis.Info)
+      //  iface.logMessage("Arrêt.", Qgis.Info)
         mapCanvas.refresh()
     }
 
@@ -866,7 +866,7 @@ function getHudText() {
             }
 
         } catch(e) {
-            iface.logMessage("Erreur startNav: " + e.toString(), Qgis.Critical)
+          //  iface.logMessage("Erreur startNav: " + e.toString(), Qgis.Critical)
         }
     }
 
@@ -1076,7 +1076,7 @@ function getHudText() {
             optimizeEntireTour(startPos)
         }
         
-        iface.logMessage("Nav démarrée.", Qgis.Info)
+     //   iface.logMessage("Nav démarrée.", Qgis.Info)
         updateNavigationLoop()
     }
 
@@ -1101,7 +1101,7 @@ function getHudText() {
                         if (newOrder.length === unvisitedPoints.length) {
                             unvisitedPoints = newOrder
                             currentTarget = unvisitedPoints[0]
-                            iface.logMessage("Tournée optimisée par OSRM.", Qgis.Success)
+                            // iface.logMessage("Tournée optimisée par OSRM.", Qgis.Success)
                         }
                     }
                 } catch(e) {}
