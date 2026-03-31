@@ -8,11 +8,45 @@ import org.qgis
 import "qrc:/qml" as QFieldItems
 
 Item {
-    id: root
+    id: drivemeTool
+    objectName: "driveMe"
     property var mainWindow: iface.mainWindow()
     property var mapCanvas: iface.mapCanvas()
+    
+    // --- VARIABLES ---
+    property var unvisitedPoints: []   
+    property var currentTarget: null   
+    property int totalPointsCount: 0
+    property bool isNavigating: false
+    property bool isPaused: false
+    
+    // HUD (Distance affichée)
+    property string distanceText: "-- m"
+    property string hudMessage: ""
+    property bool hudMessagePersistent: false
+    
+    // ÉTATS
+    property string navState: "DRIVING" 
+    property var parkedLocation: null 
+
+    // CONFIG
+    property int chainWalkThreshold: 50 
+    property var lastProcessPos: null
+    property var lastRouteCoords: null
+    property bool routeHasFootSegment: false
+    property var lastFootPos: null
+    property var polygonVertices: ({})
+    property var polygonCenters: ({})
+    property var traveledCoords: []
+    // Zoom GPS + entités filtrées — géré ici, reçu depuis FilterTool
+    property real savedZoomHW: 0
+    property real savedZoomHH: 0
+    property var pendingDriveMeLayer: null
+    property var pendingFeatExtent: null
 
     // --- COULEURS CONFIGURABLES ---
+    property string _editingKey: ""
+
     Settings {
         id: navColorSettings
         category: "NavigationPluginColors"
@@ -23,8 +57,6 @@ Item {
     }
 
     // --- COLOR WHEEL PICKER (partagé pour les 4 couleurs) ---
-    property string _editingKey: ""
-
     Popup {
         id: colorWheelPopup
         parent: mainWindow.contentItem
@@ -45,7 +77,7 @@ Item {
         property real _val: 1
 
         function openFor(key) {
-            root._editingKey = key
+            drivemeTool._editingKey = key
             var hex = ""
             if (key === "car")    hex = navColorSettings.carColor
             if (key === "foot")   hex = navColorSettings.footColor
@@ -58,17 +90,16 @@ Item {
 
         function _applyColor() {
             var hex = _hsvToHex(_hue, _sat, _val)
-            if (root._editingKey === "car")    navColorSettings.carColor    = hex
-            if (root._editingKey === "foot")   navColorSettings.footColor   = hex
-            if (root._editingKey === "park")   navColorSettings.parkColor   = hex
-            if (root._editingKey === "target") navColorSettings.targetColor = hex
+            if (drivemeTool._editingKey === "car")    navColorSettings.carColor    = hex
+            if (drivemeTool._editingKey === "foot")   navColorSettings.footColor   = hex
+            if (drivemeTool._editingKey === "park")   navColorSettings.parkColor   = hex
+            if (drivemeTool._editingKey === "target") navColorSettings.targetColor = hex
         }
 
         function _fromHex(hex) {
             if (!hex || hex.toString().length < 6) return
             var h = hex.toString()
             if (h.charAt(0) !== '#') h = '#' + h
-            // Ignorer les octets alpha éventuels (#AARRGGBB → #RRGGBB)
             if (h.length === 9) h = '#' + h.slice(3)
             var r = parseInt(h.slice(1,3), 16) / 255
             var g = parseInt(h.slice(3,5), 16) / 255
@@ -118,227 +149,203 @@ Item {
                 Layout.bottomMargin: 12
                 spacing: 10
 
-            // ── Roue QGIS : couronne hue + triangle S/V ──
-            Item {
-                Layout.alignment: Qt.AlignHCenter
-                width: 240; height: 240
-
-                Canvas {
-                    id: cwWheelCanvas
+                // ── Roue QGIS : couronne hue + triangle S/V ──
+                Item {
+                    Layout.alignment: Qt.AlignHCenter
                     width: 240; height: 240
-                    readonly property real cx:      120
-                    readonly property real cy:      120
-                    readonly property real outerR:  116
-                    readonly property real innerR:  96
-                    readonly property real ringMid: (outerR + innerR) / 2
 
-                    function hsvToRgb(h, s, v) {
-                        var r,g,b, i=Math.floor(h/60)%6, f=h/60-Math.floor(h/60)
-                        var p=v*(1-s),q=v*(1-f*s),t=v*(1-(1-f)*s)
-                        if(i===0){r=v;g=t;b=p}else if(i===1){r=q;g=v;b=p}
-                        else if(i===2){r=p;g=v;b=t}else if(i===3){r=p;g=q;b=v}
-                        else if(i===4){r=t;g=p;b=v}else{r=v;g=p;b=q}
-                        return [Math.round(r*255),Math.round(g*255),Math.round(b*255)]
-                    }
+                    Canvas {
+                        id: cwWheelCanvas
+                        width: 240; height: 240
+                        readonly property real cx:      120
+                        readonly property real cy:      120
+                        readonly property real outerR:  116
+                        readonly property real innerR:  96
+                        readonly property real ringMid: (outerR + innerR) / 2
 
-                    function triVerts() {
-                        var h0 = colorWheelPopup._hue * Math.PI / 180
-                        var h1 = h0 + 2*Math.PI/3
-                        var h2 = h0 + 4*Math.PI/3
-                        return [
-                            { x: cx + innerR*Math.cos(h0), y: cy + innerR*Math.sin(h0) },
-                            { x: cx + innerR*Math.cos(h1), y: cy + innerR*Math.sin(h1) },
-                            { x: cx + innerR*Math.cos(h2), y: cy + innerR*Math.sin(h2) }
-                        ]
-                    }
-
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.clearRect(0, 0, width, height)
-
-                        // ── Couronne hue ──
-                        for (var angle = 0; angle < 360; angle++) {
-                            var sa = (angle - 0.5) * Math.PI / 180
-                            var ea = (angle + 1.5) * Math.PI / 180
-                            var rgb = hsvToRgb(angle, 1, 1)
-                            ctx.beginPath()
-                            ctx.moveTo(cx + innerR*Math.cos(sa), cy + innerR*Math.sin(sa))
-                            ctx.arc(cx, cy, outerR, sa, ea)
-                            ctx.arc(cx, cy, innerR, ea, sa, true)
-                            ctx.closePath()
-                            ctx.fillStyle = "rgb("+rgb[0]+","+rgb[1]+","+rgb[2]+")"
-                            ctx.fill()
+                        function hsvToRgb(h, s, v) {
+                            var r,g,b, i=Math.floor(h/60)%6, f=h/60-Math.floor(h/60)
+                            var p=v*(1-s),q=v*(1-f*s),t=v*(1-(1-f)*s)
+                            if(i===0){r=v;g=t;b=p}else if(i===1){r=q;g=v;b=p}
+                            else if(i===2){r=p;g=v;b=t}else if(i===3){r=p;g=q;b=v}
+                            else if(i===4){r=t;g=p;b=v}else{r=v;g=p;b=q}
+                            return [Math.round(r*255),Math.round(g*255),Math.round(b*255)]
                         }
-                        ctx.beginPath(); ctx.arc(cx,cy,outerR,0,Math.PI*2)
-                        ctx.strokeStyle="#777"; ctx.lineWidth=1; ctx.stroke()
-                        ctx.beginPath(); ctx.arc(cx,cy,innerR,0,Math.PI*2)
-                        ctx.strokeStyle="#777"; ctx.lineWidth=1; ctx.stroke()
 
-                        // ── Triangle intérieur ──
-                        var vt = triVerts()
-                        var t0=vt[0], t1=vt[1], t2=vt[2]
-                        function triPath() {
-                            ctx.beginPath()
-                            ctx.moveTo(t0.x,t0.y); ctx.lineTo(t1.x,t1.y)
-                            ctx.lineTo(t2.x,t2.y); ctx.closePath()
+                        function triVerts() {
+                            var h0 = colorWheelPopup._hue * Math.PI / 180
+                            var h1 = h0 + 2*Math.PI/3
+                            var h2 = h0 + 4*Math.PI/3
+                            return [
+                                { x: cx + innerR*Math.cos(h0), y: cy + innerR*Math.sin(h0) },
+                                { x: cx + innerR*Math.cos(h1), y: cy + innerR*Math.sin(h1) },
+                                { x: cx + innerR*Math.cos(h2), y: cy + innerR*Math.sin(h2) }
+                            ]
                         }
-                        var rgb0 = hsvToRgb(colorWheelPopup._hue, 1, 1)
-                        triPath(); ctx.fillStyle="rgb("+rgb0[0]+","+rgb0[1]+","+rgb0[2]+")"; ctx.fill()
 
-                        var mid01x=(t0.x+t2.x)/2, mid01y=(t0.y+t2.y)/2
-                        var gw = ctx.createLinearGradient(t1.x,t1.y, mid01x,mid01y)
-                        gw.addColorStop(0,"rgba(255,255,255,1)"); gw.addColorStop(1,"rgba(255,255,255,0)")
-                        triPath(); ctx.fillStyle=gw; ctx.fill()
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.clearRect(0, 0, width, height)
 
-                        var mid02x=(t0.x+t1.x)/2, mid02y=(t0.y+t1.y)/2
-                        var gb = ctx.createLinearGradient(t2.x,t2.y, mid02x,mid02y)
-                        gb.addColorStop(0,"rgba(0,0,0,1)"); gb.addColorStop(1,"rgba(0,0,0,0)")
-                        triPath(); ctx.fillStyle=gb; ctx.fill()
-
-                        triPath(); ctx.strokeStyle="rgba(0,0,0,0.25)"; ctx.lineWidth=1; ctx.stroke()
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        onPressed:         _handle(mouseX, mouseY)
-                        onPositionChanged: if (pressed) _handle(mouseX, mouseY)
-                        function _handle(mx, my) {
-                            var dx=mx-cwWheelCanvas.cx, dy=my-cwWheelCanvas.cy
-                            var dist=Math.sqrt(dx*dx+dy*dy)
-                            if (dist >= cwWheelCanvas.innerR && dist <= cwWheelCanvas.outerR) {
-                                colorWheelPopup._hue = ((Math.atan2(dy,dx)*180/Math.PI)+360)%360
-                                colorWheelPopup._updateAll(); return
+                            // ── Couronne hue ──
+                            for (var angle = 0; angle < 360; angle++) {
+                                var sa = (angle - 0.5) * Math.PI / 180
+                                var ea = (angle + 1.5) * Math.PI / 180
+                                var rgb = hsvToRgb(angle, 1, 1)
+                                ctx.beginPath()
+                                ctx.moveTo(cx + innerR*Math.cos(sa), cy + innerR*Math.sin(sa))
+                                ctx.arc(cx, cy, outerR, sa, ea)
+                                ctx.arc(cx, cy, innerR, ea, sa, true)
+                                ctx.closePath()
+                                ctx.fillStyle = "rgb("+rgb[0]+","+rgb[1]+","+rgb[2]+")"
+                                ctx.fill()
                             }
-                            if (dist < cwWheelCanvas.innerR) {
-                                var vt = cwWheelCanvas.triVerts()
-                                var t0=vt[0], t1=vt[1], t2=vt[2]
-                                var denom = (t1.y-t2.y)*(t0.x-t2.x) + (t2.x-t1.x)*(t0.y-t2.y)
-                                if (Math.abs(denom) < 0.001) return
-                                var a = ((t1.y-t2.y)*(mx-t2.x) + (t2.x-t1.x)*(my-t2.y)) / denom
-                                var b = ((t2.y-t0.y)*(mx-t2.x) + (t0.x-t2.x)*(my-t2.y)) / denom
-                                var c = 1-a-b
-                                a=Math.max(0,a); b=Math.max(0,b); c=Math.max(0,c)
-                                var sum=a+b+c; a/=sum; b/=sum; c/=sum
-                                var newV = a+b
-                                colorWheelPopup._val = Math.max(0, Math.min(1, newV))
-                                colorWheelPopup._sat = Math.max(0, Math.min(1, newV > 0.001 ? a/newV : 0))
-                                colorWheelPopup._updateAll()
+                            ctx.beginPath(); ctx.arc(cx,cy,outerR,0,Math.PI*2)
+                            ctx.strokeStyle="#777"; ctx.lineWidth=1; ctx.stroke()
+                            ctx.beginPath(); ctx.arc(cx,cy,innerR,0,Math.PI*2)
+                            ctx.strokeStyle="#777"; ctx.lineWidth=1; ctx.stroke()
+
+                            // ── Triangle intérieur ──
+                            var vt = triVerts()
+                            var t0=vt[0], t1=vt[1], t2=vt[2]
+                            function triPath() {
+                                ctx.beginPath()
+                                ctx.moveTo(t0.x,t0.y); ctx.lineTo(t1.x,t1.y)
+                                ctx.lineTo(t2.x,t2.y); ctx.closePath()
+                            }
+                            var rgb0 = hsvToRgb(colorWheelPopup._hue, 1, 1)
+                            triPath(); ctx.fillStyle="rgb("+rgb0[0]+","+rgb0[1]+","+rgb0[2]+")"; ctx.fill()
+
+                            var mid01x=(t0.x+t2.x)/2, mid01y=(t0.y+t2.y)/2
+                            var gw = ctx.createLinearGradient(t1.x,t1.y, mid01x,mid01y)
+                            gw.addColorStop(0,"rgba(255,255,255,1)"); gw.addColorStop(1,"rgba(255,255,255,0)")
+                            triPath(); ctx.fillStyle=gw; ctx.fill()
+
+                            var mid02x=(t0.x+t1.x)/2, mid02y=(t0.y+t1.y)/2
+                            var gb = ctx.createLinearGradient(t2.x,t2.y, mid02x,mid02y)
+                            gb.addColorStop(0,"rgba(0,0,0,1)"); gb.addColorStop(1,"rgba(0,0,0,0)")
+                            triPath(); ctx.fillStyle=gb; ctx.fill()
+
+                            triPath(); ctx.strokeStyle="rgba(0,0,0,0.25)"; ctx.lineWidth=1; ctx.stroke()
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onPressed:         _handle(mouseX, mouseY)
+                            onPositionChanged: if (pressed) _handle(mouseX, mouseY)
+                            function _handle(mx, my) {
+                                var dx=mx-cwWheelCanvas.cx, dy=my-cwWheelCanvas.cy
+                                var dist=Math.sqrt(dx*dx+dy*dy)
+                                if (dist >= cwWheelCanvas.innerR && dist <= cwWheelCanvas.outerR) {
+                                    colorWheelPopup._hue = ((Math.atan2(dy,dx)*180/Math.PI)+360)%360
+                                    colorWheelPopup._updateAll(); return
+                                }
+                                if (dist < cwWheelCanvas.innerR) {
+                                    var vt = cwWheelCanvas.triVerts()
+                                    var t0=vt[0], t1=vt[1], t2=vt[2]
+                                    var denom = (t1.y-t2.y)*(t0.x-t2.x) + (t2.x-t1.x)*(t0.y-t2.y)
+                                    if (Math.abs(denom) < 0.001) return
+                                    var a = ((t1.y-t2.y)*(mx-t2.x) + (t2.x-t1.x)*(my-t2.y)) / denom
+                                    var b = ((t2.y-t0.y)*(mx-t2.x) + (t0.x-t2.x)*(my-t2.y)) / denom
+                                    var c = 1-a-b
+                                    a=Math.max(0,a); b=Math.max(0,b); c=Math.max(0,c)
+                                    var sum=a+b+c; a/=sum; b/=sum; c/=sum
+                                    var newV = a+b
+                                    colorWheelPopup._val = Math.max(0, Math.min(1, newV))
+                                    colorWheelPopup._sat = Math.max(0, Math.min(1, newV > 0.001 ? a/newV : 0))
+                                    colorWheelPopup._updateAll()
+                                }
                             }
                         }
                     }
+
+                    // Curseur couronne
+                    Rectangle {
+                        property real rad: colorWheelPopup._hue * Math.PI / 180
+                        x: cwWheelCanvas.cx + cwWheelCanvas.ringMid * Math.cos(rad) - 8
+                        y: cwWheelCanvas.cy + cwWheelCanvas.ringMid * Math.sin(rad) - 8
+                        width: 16; height: 16; radius: 8
+                        color: "transparent"
+                        border.color: "white"; border.width: 2.5
+                        antialiasing: true
+                    }
+
+                    // Curseur triangle
+                    Rectangle {
+                        property var verts: cwWheelCanvas.triVerts()
+                        property var p0: verts[0]; property var p1: verts[1]; property var p2: verts[2]
+                        property real sv: colorWheelPopup._sat
+                        property real vv: colorWheelPopup._val
+                        property real px: vv*(sv*p0.x + (1-sv)*p1.x) + (1-vv)*p2.x
+                        property real py: vv*(sv*p0.y + (1-sv)*p1.y) + (1-vv)*p2.y
+                        x: px - 8; y: py - 8
+                        width: 16; height: 16; radius: 8
+                        color: cwPreview.color
+                        border.color: "white"; border.width: 2.5
+                        antialiasing: true
+                    }
                 }
 
-                // Curseur couronne
-                Rectangle {
-                    property real rad: colorWheelPopup._hue * Math.PI / 180
-                    x: cwWheelCanvas.cx + cwWheelCanvas.ringMid * Math.cos(rad) - 8
-                    y: cwWheelCanvas.cy + cwWheelCanvas.ringMid * Math.sin(rad) - 8
-                    width: 16; height: 16; radius: 8
-                    color: "transparent"
-                    border.color: "white"; border.width: 2.5
-                    antialiasing: true
-                }
+                Canvas { id: cwBrightCanvas; width:1; height:1; visible:false; onPaint:{} }
 
-                // Curseur triangle
-                Rectangle {
-                    property var verts: cwWheelCanvas.triVerts()
-                    property var p0: verts[0]; property var p1: verts[1]; property var p2: verts[2]
-                    property real sv: colorWheelPopup._sat
-                    property real vv: colorWheelPopup._val
-                    property real px: vv*(sv*p0.x + (1-sv)*p1.x) + (1-vv)*p2.x
-                    property real py: vv*(sv*p0.y + (1-sv)*p1.y) + (1-vv)*p2.y
-                    x: px - 8; y: py - 8
-                    width: 16; height: 16; radius: 8
-                    color: cwPreview.color
-                    border.color: "white"; border.width: 2.5
-                    antialiasing: true
-                }
-            }
-
-            Canvas { id: cwBrightCanvas; width:1; height:1; visible:false; onPaint:{} }
-
-            // ── Aperçu + hex ──
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 10
-                Rectangle {
-                    id: cwPreview
-                    width: 44; height: 44; radius: 22
-                    color: "#FF0000"
-                    border.color: "#aaa"; border.width: 2
-                    antialiasing: true
-                }
-                ColumnLayout {
+                // ── Aperçu + hex ──
+                RowLayout {
                     Layout.fillWidth: true
-                    spacing: 3
-                    Label { text: tr("Code couleur"); font.pixelSize: 10; color: "#888" }
-                    TextField {
-                        id: cwHexField
+                    spacing: 10
+                    Rectangle {
+                        id: cwPreview
+                        width: 44; height: 44; radius: 22
+                        color: "#FF0000"
+                        border.color: "#aaa"; border.width: 2
+                        antialiasing: true
+                    }
+                    ColumnLayout {
                         Layout.fillWidth: true
-                        text: "#FF0000"
-                        maximumLength: 7
-                        font.pixelSize: 14
-                        leftPadding: 8
-                        background: Rectangle {
-                            color: "#f5f5f5"
-                            border.color: cwHexField.activeFocus ? Theme.mainColor : "#ccc"
-                            border.width: 1; radius: 6
-                        }
-                        color: "#333"
-                        onAccepted: {
-                            var v = text.trim()
-                            if (v.charAt(0) !== '#') v = '#' + v
-                            if (v.length === 7) { colorWheelPopup._fromHex(v); colorWheelPopup._updateAll() }
+                        spacing: 3
+                        Label { text: tr("Code couleur"); font.pixelSize: 10; color: "#888" }
+                        TextField {
+                            id: cwHexField
+                            Layout.fillWidth: true
+                            text: "#FF0000"
+                            maximumLength: 7
+                            font.pixelSize: 14
+                            leftPadding: 8
+                            background: Rectangle {
+                                color: "#f5f5f5"
+                                border.color: cwHexField.activeFocus ? Theme.mainColor : "#ccc"
+                                border.width: 1; radius: 6
+                            }
+                            color: "#333"
+                            onAccepted: {
+                                var v = text.trim()
+                                if (v.charAt(0) !== '#') v = '#' + v
+                                if (v.length === 7) { colorWheelPopup._fromHex(v); colorWheelPopup._updateAll() }
+                            }
                         }
                     }
                 }
-            }
 
-            // ── Boutons ──
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 10
-                Button {
-                    text: tr("Annuler"); Layout.fillWidth: true
-                    background: Rectangle { color: parent.down ? "#ddd" : "#eee"; radius: 6; border.color: "#ccc"; border.width: 1 }
-                    contentItem: Text { text: parent.text; color: "#333"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                    onClicked: colorWheelPopup.close()
+                // ── Boutons ──
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Button {
+                        text: tr("Annuler"); Layout.fillWidth: true
+                        background: Rectangle { color: parent.down ? "#ddd" : "#eee"; radius: 6; border.color: "#ccc"; border.width: 1 }
+                        contentItem: Text { text: parent.text; color: "#333"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: colorWheelPopup.close()
+                    }
+                    Button {
+                        text: "OK"; Layout.fillWidth: true
+                        background: Rectangle { color: parent.down ? Qt.darker(Theme.mainColor,1.2) : Theme.mainColor; radius: 6 }
+                        contentItem: Text { text: parent.text; color: "white"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: { colorWheelPopup._applyColor(); colorWheelPopup.close() }
+                    }
                 }
-                Button {
-                    text: "OK"; Layout.fillWidth: true
-                    background: Rectangle { color: parent.down ? Qt.darker(Theme.mainColor,1.2) : Theme.mainColor; radius: 6 }
-                    contentItem: Text { text: parent.text; color: "white"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                    onClicked: { colorWheelPopup._applyColor(); colorWheelPopup.close() }
-                }
-            }
 
             }   // ColumnLayout inner
         }   // ColumnLayout cwMainCol
-    }
-
-    // --- VARIABLES ---
-    property var unvisitedPoints: []   
-    property var currentTarget: null   
-    property int totalPointsCount: 0
-    property bool isNavigating: false
-    
-    // HUD (Distance affichée)
-    property string distanceText: "-- m"
-    property string hudMessage: ""
-    
-    // ÉTATS
-    property string navState: "DRIVING" 
-    property var parkedLocation: null 
-
-    // CONFIG
-    property int chainWalkThreshold: 50 
-    property var lastProcessPos: null
-    property var lastRouteCoords: null
-    property bool routeHasFootSegment: false
-    property var lastFootPos: null
-    property var polygonVertices: ({})  // sommets WGS84 par id de polygone, pour affinage post-route
-    property var polygonCenters: ({})   // point intérieur (point_on_surface ou centroïde) par id de polygone
-    property var traveledCoords: []     // historique du trajet parcouru — anti-demi-tour
+    }   // colorWheelPopup
 
     // --- TRADUCTION FR / EN ---
     property string currentLang: "fr"
@@ -349,32 +356,36 @@ Item {
     }
 
     property var translations: {
-        "RESTANT":                          { "fr": "RESTANT",                          "en": "REMAINING" },
-        "DISTANCE":                         { "fr": "DISTANCE",                         "en": "DISTANCE" },
-        "NAVIGATION":                       { "fr": "NAVIGATION",                       "en": "NAVIGATION" },
-        "Couche:":                          { "fr": "Couche :",                         "en": "Layer:" },
-        "ARRÊTER":                          { "fr": "ARRÊTER",                          "en": "STOP" },
-        "DÉMARRER":                         { "fr": "DÉMARRER",                         "en": "START" },
-        "Aucun élément trouvé":             { "fr": "Aucun élément trouvé",             "en": "No features found" },
-        "Vers les géométries de la couche :":                          { "fr": "Vers les géométries de la couche :",                         "en": "Towards the geometries of layer :" },
-       "Code couleur":             { "fr": "Code couleur",             "en": "Color code" },
-        "Tracé voiture":             { "fr": "Tracé voiture",             "en": "Car route" },
-        "Tracé piéton":             { "fr": "Tracé piéton",                    "en": "Walk route" },
-        "Stationnement":             { "fr": "Stationnement",                    "en": "Parking" },
-        "Points cibles":             { "fr": "Points cibles",                    "en": "Target points" },
-        "Annuler":                        { "fr": "Annuler",                        "en": "Cancel" },
-        "Aucun point trouvé":               { "fr": "Aucun point trouvé",               "en": "No points found" },
-        "✅ Cible atteinte !":              { "fr": "✅ Cible atteinte !",              "en": "✅ Target reached!" },
-        "✅ Point validé\nau passage !":   { "fr": "✅ Point validé\nau passage !",   "en": "✅ Point validated\non the way!" },
-        "Retour au véhicule.":              { "fr": "Retour au véhicule.",              "en": "Return to vehicle." },
-        "🏁 Terminé !":                    { "fr": "🏁 Terminé !",                    "en": "🏁 Done!" },
-        "Accès à pied\n(point isolé)":     { "fr": "Accès à pied\n(point isolé)",     "en": "On foot\n(isolated point)" },
-        "👟 À pied plus rapide":           { "fr": "👟 À pied plus rapide",           "en": "👟 Faster on foot" },
-        "🚗 Retour voiture":               { "fr": "🚗 Retour voiture",               "en": "🚗 Back to car" },
-        "min gagnées":                      { "fr": "min gagnées",                      "en": "min saved" },
-        "En route.":                        { "fr": "En route.",                        "en": "Drive on." },
-        "Fin de route.\nFinir à pied.":    { "fr": "Fin de route.\nFinir à pied.",    "en": "End of road.\nFinish on foot." },
-        "Voiture stationnée.\nFinir à pied.": { "fr": "Voiture stationnée.\nFinir à pied.", "en": "Vehicle parked.\nFinish on foot." }
+        "RESTANT":                               { "fr": "RESTANT",                               "en": "REMAINING" },
+        "DISTANCE":                              { "fr": "DISTANCE",                              "en": "DISTANCE" },
+        "NAVIGATION":                            { "fr": "NAVIGATION",                            "en": "NAVIGATION" },
+        "Couche:":                               { "fr": "Couche :",                              "en": "Layer:" },
+        "ARRÊTER":                               { "fr": "ARRÊTER",                               "en": "STOP" },
+        "DÉMARRER":                              { "fr": "DÉMARRER",                              "en": "START" },
+        "Aucun élément trouvé":                  { "fr": "Aucun élément trouvé",                  "en": "No features found" },
+        "Aucun point trouvé":                    { "fr": "Aucun point trouvé",                    "en": "No points found" },
+        "Calcul de l'itinéraire en pause":       { "fr": "Calcul de l'itinéraire en pause",       "en": "Calculate way in pause" },
+        "Calcul de l'itinéraire activé":         { "fr": "Calcul de l'itinéraire activé",         "en": "Calculate way reactivated" },
+        "✅ Cible atteinte !":                   { "fr": "✅ Cible atteinte !",                   "en": "✅ Target reached!" },
+        "✅ Point validé\nau passage !":          { "fr": "✅ Point validé\nau passage !",          "en": "✅ Point validated\non the way!" },
+        "Retour au véhicule.":                   { "fr": "Retour au véhicule.",                   "en": "Return to vehicle." },
+"🔄 Retour voiture :\naccès route plus court(-": { "fr": "🔄 Retour voiture :\naccès route plus court\n(-", "en": "🔄 Return to car:\nshorter road access(-" },
+        "🏁 Terminé !":                          { "fr": "🏁 Terminé !",                          "en": "🏁 Done!" },
+        "Accès à pied\n(point isolé)":           { "fr": "Accès à pied\n(point isolé)",           "en": "On foot\n(isolated point)" },
+        "👟 À pied plus rapide":                 { "fr": "👟 À pied plus rapide",                 "en": "👟 Faster on foot" },
+        "🚗 Retour voiture":                     { "fr": "🚗 Retour voiture",                     "en": "🚗 Back to car" },
+        "min gagnées":                           { "fr": "min gagnées",                           "en": "min saved" },
+        "En route.":                             { "fr": "En route.",                             "en": "Drive on." },
+        "Fin de route.\nFinir à pied.":          { "fr": "Fin de route.\nFinir à pied.",          "en": "End of road.\nFinish on foot." },
+        "Voiture stationnée.\nFinir à pied.":    { "fr": "Voiture stationnée.\nFinir à pied.",    "en": "Vehicle parked.\nFinish on foot." },
+        // Clés pour le dialogue de navigation
+        "Vers les géométries de la couche :":    { "fr": "Vers les géométries de la couche :",    "en": "Towards the geometries of layer:" },
+        "Code couleur":                          { "fr": "Code couleur",                          "en": "Color code" },
+        "Tracé voiture":                         { "fr": "Tracé voiture",                         "en": "Car route" },
+        "Tracé piéton":                          { "fr": "Tracé piéton",                          "en": "Walk route" },
+        "Stationnement":                         { "fr": "Stationnement",                         "en": "Parking" },
+        "Points cibles":                         { "fr": "Points cibles",                         "en": "Target points" },
+        "Annuler":                               { "fr": "Annuler",                               "en": "Cancel" }
     }
 
     function tr(key) {
@@ -416,7 +427,7 @@ Item {
         mapSettings: mapCanvas.mapSettings
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 14
-        color: navColorSettings.targetColor // Rouge — points cibles clignotants
+        color: navColorSettings.targetColor
         opacity: 0.9
         SequentialAnimation on opacity {
             loops: Animation.Infinite
@@ -450,6 +461,15 @@ Item {
         lineWidth: 2
         color: "#FF00FF" // Fuschia fin — flèches sommet rouge → centroïde fuschia
         opacity: 0.75
+    }
+
+    // Transformateur GPS WGS84 → CRS carte, pour le zoom position+entités
+    CoordinateTransformer {
+        id: gpsMapTransformer
+        sourceCrs: CoordinateReferenceSystemUtils.wgs84Crs()
+        destinationCrs: mapCanvas.mapSettings.destinationCrs
+        transformContext: qgisProject ? qgisProject.transformContext
+                                      : CoordinateReferenceSystemUtils.emptyTransformContext()
     }
 
     // --- 2. MARQUEURS ---
@@ -522,150 +542,289 @@ Item {
         border.width: 1
 
         RowLayout {
-    anchors.fill: parent
-    anchors.margins: 5
-    spacing: 6
+            anchors.fill: parent
+            anchors.margins: 5
+            spacing: 6
 
-    // 1. Compteur de points
-    Column {
-        Layout.fillWidth: true
-        Layout.preferredWidth: 3   // poids = 3 parts
-        Layout.alignment: Qt.AlignVCenter
-        Text { text: tr("RESTANT"); color: "#FFFFFF"; font.pixelSize: 10; font.bold: true }
-        Text { text: unvisitedPoints.length + " / " + totalPointsCount; color: "#00FF00"; font.pixelSize: 18; font.bold: true }
-    }
-
-    Rectangle { width: 1; height: 40; color: "gray"; Layout.alignment: Qt.AlignVCenter }
-
-    // 2. Mode actuel (avec défilement)
-Item {
-    Layout.fillWidth: true
-    Layout.preferredWidth: 3
-    Layout.alignment: Qt.AlignVCenter
-    height: 40
-    clip: true  // masque le texte qui dépasse
-
-    Text {
-        id: hudText
-        text: getHudText()
-        color: "white"
-        font.pixelSize: 14
-        font.bold: true
-        anchors.verticalCenter: parent.verticalCenter
-
-        // Lance le défilement si le texte est trop large
-        onTextChanged: {
-            if (hudText.width > hudText.parent.width) {
-                marqueeAnim.from = hudText.parent.width
-                marqueeAnim.to = -hudText.width
-                marqueeAnim.duration = (hudText.width + hudText.parent.width) * 16
-                marqueeAnim.restart()
-            } else {
-                marqueeAnim.stop()
-                hudText.x = 0
+            // 1. Compteur de points
+            Column {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 3
+                Layout.alignment: Qt.AlignVCenter
+                Text { text: tr("RESTANT"); color: "#FFFFFF"; font.pixelSize: 10; font.bold: true }
+                Text { text: unvisitedPoints.length + " / " + totalPointsCount; color: "#00FF00"; font.pixelSize: 18; font.bold: true }
             }
-        }
 
-        NumberAnimation {
-            id: marqueeAnim
-            target: hudText
-            property: "x"
-            loops: Animation.Infinite
-            easing.type: Easing.Linear
-        }
-    }
-}
+            Rectangle { width: 1; height: 40; color: "gray"; Layout.alignment: Qt.AlignVCenter }
 
-    // 3. Distance
-    Column {
-        Layout.fillWidth: true
-        Layout.preferredWidth: 3   // poids = 3 parts
-        Layout.alignment: Qt.AlignVCenter
-        Text { text: tr("DISTANCE"); color: "#FFFFFF"; font.pixelSize: 10; font.bold: true }
-        Text { text: distanceText; color: "cyan"; font.pixelSize: 18; font.bold: true }
-    }
+            // 2. Mode actuel (avec défilement)
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 3
+                Layout.alignment: Qt.AlignVCenter
+                height: 40
+                clip: true
 
-    // Bouton d'arrêt
-    Item {
+                Text {
+                    id: hudText
+                    text: getHudText()
+                    color: "white"
+                    font.pixelSize: 14
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    SequentialAnimation on x {
+                        id: marqueeAnim
+                        loops: Animation.Infinite
+                        running: hudText.implicitWidth > hudText.parent.width
+                        PauseAnimation  { duration: 500 }
+                        NumberAnimation {
+                            from:     hudText.parent ? hudText.parent.width : 0
+                            to:       -(hudText.implicitWidth)
+                            duration: hudText.implicitWidth > 0
+                                        ? (hudText.implicitWidth + (hudText.parent ? hudText.parent.width : 0)) * 16
+                                        : 1
+                            easing.type: Easing.Linear
+                        }
+                    }
+                }
+            }
+
+            // 3. Distance
+            Column {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 3
+                Layout.alignment: Qt.AlignVCenter
+                Text { text: tr("DISTANCE"); color: "#FFFFFF"; font.pixelSize: 10; font.bold: true }
+                Text { text: distanceText; color: "cyan"; font.pixelSize: 18; font.bold: true }
+            }
+
+            // Bouton pause/arrêt
+            Item {
         Layout.fillWidth: true
         Layout.preferredWidth: 2   // poids = 2 parts (plus petit)
         Layout.alignment: Qt.AlignVCenter
         implicitHeight: parent.height
         QfToolButton {
-            anchors.centerIn: parent
-            iconSource: "icon.svg"; iconColor: "red"; flat: true
-            onClicked: stopNavigation()
+    anchors.centerIn: parent
+    iconSource: "icon.svg"
+    iconColor: isPaused ? "orange" : "red"
+    flat: true
+
+    onClicked: {
+        if (!isNavigating) return
+
+        isPaused = !isPaused
+
+        if (isPaused) {
+            showHudMessage("Navigation en pause")
+        } else {
+            showHudMessage("Navigation reprise")
         }
     }
-  }
-}
 
-Timer {
-    id: hudMessageTimer
-    interval: 3000  // Message visible 3 secondes
-    repeat: false
-    onTriggered: hudMessage = ""
-}
+    onPressAndHold: {
+        if (!isNavigating) return
 
-function showHudMessage(text) {
-    hudMessage = text
-    hudMessageTimer.restart()
-}
+        isPaused = false
+        stopNavigation()
+        showHudMessage("Navigation arrêtée")
+                    }
+                }
+            }
+        }
+    }
 
-function getHudText() {
-    if (hudMessage !== "") return hudMessage
-   // if (navState === "RETURNING_TO_CAR") return "Retour\nvéhicule"
-  //  if (navState === "DRIVING") return "Étape\nsuivante"
-   // return "À pied"
-    return ""
-}
+    Timer {
+        id: hudMessageTimer
+        interval: 5000
+        repeat: false
+        onTriggered: {
+            if (!drivemeTool.hudMessagePersistent)
+                hudMessage = ""
+        }
+    }
+
+    function showHudMessage(text, persistent) {
+        hudMessagePersistent = (persistent === true)   
+        hudMessage = text
+        if (!hudMessagePersistent)
+            hudMessageTimer.restart()
+        else
+            hudMessageTimer.stop()
+    }
+
+    function getHudText() {
+        if (hudMessage !== "") return hudMessage
+        return ""
+    }
 
     // --- 4. TIMER ---
     Timer {
         id: navTimer
-        interval: 800 // 2 secondes pour laisser le temps au réseau
+        interval: 800
         repeat: true
-        running: isNavigating
+        running: isNavigating && !isPaused
         onTriggered: updateNavigationLoop()
     }
 
-    // --- 5. BOUTON ---
+    // --- ZOOM GPS + ENTITÉS FILTRÉES ---
+    Timer {
+    id: recenterTimer
+    interval: 400
+    repeat: false
+    onTriggered: {
+        try {
+            let gpsPt = getCurrentGpsPosition()
+            if (!gpsPt) gpsPt = getMapCenter() // Secours si pas de GPS
+
+            if (gpsPt) {
+                let gpsGeom = GeometryUtils.createGeometryFromWkt("POINT(" + gpsPt.x + " " + gpsPt.y + ")")
+                gpsMapTransformer.sourcePosition = GeometryUtils.centroid(gpsGeom)
+                let proj = gpsMapTransformer.projectedPosition
+
+                if (proj && (proj.x !== 0 || proj.y !== 0)) {
+                    let featExt = pendingFeatExtent
+                    if (featExt) {
+                        // Calcul des distances par rapport à ma position pour tout englober
+                        let dx = Math.max(Math.abs(proj.x - featExt.xMinimum), Math.abs(proj.x - featExt.xMaximum))
+                        let dy = Math.max(Math.abs(proj.y - featExt.yMinimum), Math.abs(proj.y - featExt.yMaximum))
+                        
+                        // Marge de 20% pour ne pas être collé aux bords
+                        dx = dx * 1.2
+                        dy = dy * 1.2
+
+                        let screenRatio = mapCanvas.width / (mapCanvas.height > 0 ? mapCanvas.height : 1)
+                        if (dx / dy > screenRatio) {
+                            dy = dx / screenRatio
+                        } else {
+                            dx = dy * screenRatio
+                        }
+
+                        // Création de la nouvelle emprise centrée sur MOI englobant les CIBLES
+                        featExt.xMinimum = proj.x - dx
+                        featExt.xMaximum = proj.x + dx
+                        featExt.yMinimum = proj.y - dy
+                        featExt.yMaximum = proj.y + dy
+
+                        mapCanvas.mapSettings.setExtent(featExt, true)
+                    }
+                }
+            }
+        } catch(e) { console.log("Erreur Zoom: " + e) }
+        
+        // Lance la Phase 2 (Démarrage effectif de la navigation) après un court délai
+        startDriveTimer.restart()
+    }
+}
+
+    Timer {
+        id: startDriveTimer
+        interval: 300
+        repeat: false
+        onTriggered: {
+            if (pendingDriveMeLayer !== null) {
+                startNavigationProcess(pendingDriveMeLayer)
+                pendingDriveMeLayer = null
+                zoomToGpsTimer.restart()
+            }
+        }
+    }
+
+    Timer {
+        id: zoomToGpsTimer
+        interval: 2000
+        repeat: false
+        onTriggered: {
+            try {
+                let gpsPt = getCurrentGpsPosition()
+                if (gpsPt) {
+                    let gpsGeom = GeometryUtils.createGeometryFromWkt(
+                        "POINT(" + gpsPt.x + " " + gpsPt.y + ")")
+                    if (gpsGeom) {
+                        gpsMapTransformer.sourcePosition = GeometryUtils.centroid(gpsGeom)
+                        let proj = gpsMapTransformer.projectedPosition
+                        if (proj && (proj.x !== 0 || proj.y !== 0)) {
+                            let ext = mapCanvas.mapSettings.extent
+                            let destCrs = mapCanvas.mapSettings.destinationCrs
+                            let zoomRadius = 300
+                            if (destCrs && destCrs.isGeographic) {
+                                zoomRadius = 0.0027
+                            }
+                            let screenRatio = mapCanvas.width / (mapCanvas.height > 0 ? mapCanvas.height : 1)
+                            let hw = zoomRadius
+                            let hh = zoomRadius / screenRatio
+                            ext.xMinimum = proj.x - hw
+                            ext.xMaximum = proj.x + hw
+                            ext.yMinimum = proj.y - hh
+                            ext.yMaximum = proj.y + hh
+                            mapCanvas.mapSettings.setExtent(ext, true)
+                        }
+                    }
+                }
+            } catch(e) {}
+        }
+    }
+
+    // --- 5. POINT D'ENTRÉE EXTERNE ---
+    // Appelé par FilterTool via iface.findItemByObjectName("driveMe")
+    function startWithLayer(layer) {
+        if (layer) {
+            startNavigationProcess(layer)
+        }
+    }
+
+    // Point d'entrée depuis FilterTool quand "Filter & Drive me" est activé.
+    function startWithLayerAndExtent(layer, featExtent) {
+        if (!layer) return
+        pendingDriveMeLayer = layer
+        pendingFeatExtent   = featExtent
+        recenterTimer.restart()
+    }
+
+    // --- 5b. BOUTON TOOLBAR ---
     QfToolButton {
         id: btnNav
         iconSource: "icon.svg"
-        iconColor: isNavigating ? "red" : "#80cc28"
+        iconColor: { if (isPaused) return "orange"; if (isNavigating) return "red"; "#89cc28" } 
         bgcolor: Theme.darkGray
         round: true
         onClicked: { updateLayers(); dialogNav.open() }
+
+        onPressAndHold: {
+        if (!isNavigating) return
+
+        isPaused = false
+        stopNavigation()
+        showHudMessage("Navigation arrêtée")
+                    }
     }
 
-    // --- 6. DIALOGUE ---
+    // --- 5c. DIALOGUE DE NAVIGATION ---
     Dialog {
-    id: dialogNav
-    parent: mainWindow.contentItem
-    modal: true
-    width: Math.min(mainWindow.width * 0.8, 450)
-    x: (mainWindow.width - width) / 2
-    y: (mainWindow.height - height) / 2
-    background: Rectangle { color: "white"; border.color: Theme.mainColor; border.width: 2; radius: 8 }
+        id: dialogNav
+        parent: mainWindow.contentItem
+        modal: true
+        width: Math.min(mainWindow.width * 0.8, 450)
+        x: (mainWindow.width - width) / 2
+        y: (mainWindow.height - height) / 2
+        background: Rectangle { color: "white"; border.color: Theme.mainColor; border.width: 2; radius: 8 }
 
-    property bool isLandscape: mainWindow.width > mainWindow.height
-    property real scaleFactor: isLandscape
-        ? Math.min(1.0, mainWindow.height * 0.92 / Math.max(implicitHeight, 1))
-        : 1.0
-
-    scale: scaleFactor
+        property bool isLandscape: mainWindow.width > mainWindow.height
+        property real scaleFactor: isLandscape
+            ? Math.min(1.0, mainWindow.height * 0.92 / Math.max(implicitHeight, 1))
+            : 1.0
+        scale: scaleFactor
 
         contentItem: ColumnLayout {
             spacing: 0
 
-            // Titre — intégré dans contentItem pour que la bordure du background fasse tout le tour
+            // Titre
             Rectangle {
                 Layout.fillWidth: true
                 implicitHeight: titleLabel.implicitHeight + 5
                 color: "white"
                 radius: 8
-                // Supprime les coins ronds du bas pour raccorder proprement au contenu blanc
                 Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: parent.radius; color: parent.color }
                 Label {
                     id: titleLabel
@@ -675,117 +834,117 @@ function getHudText() {
                 }
             }
 
-            // Séparateur visuel
-          //  Rectangle { Layout.fillWidth: true; height: 1; color: Theme.mainColor 
-     }
-
             ColumnLayout {
-            spacing: 15
-            Layout.fillWidth: true
-            Layout.topMargin: 12
-            Layout.leftMargin: 12
-            Layout.rightMargin: 12
-            Layout.bottomMargin: 6
-            Label { text: tr("Vers les géométries de la couche :") }
-            QfComboBox { id: layerSelector; Layout.fillWidth: true; model:[]; enabled: !isNavigating }
-
-            // --- COULEURS ---  
-
-            // Ligne de couleur réutilisable via GridLayout
-            GridLayout {
+                spacing: 15
                 Layout.fillWidth: true
-                columns: 2
-                columnSpacing: 8
-                rowSpacing: 8
+                Layout.topMargin: 12
+                Layout.leftMargin: 12
+                Layout.rightMargin: 12
+                Layout.bottomMargin: 6
 
-                // --- Tracé voiture ---
-                Rectangle {
+                Label { text: tr("Vers les géométries de la couche :") }
+                QfComboBox { id: layerSelector; Layout.fillWidth: true; model: []; enabled: !isNavigating }
+
+                // --- COULEURS ---
+                GridLayout {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 52
-                    color: "#259E9E9E"
-                    border.color: Theme.controlBorderColor; border.width: 1; radius: 6
-                    MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("car") }
-                    RowLayout {
-                        anchors.fill: parent; anchors.margins: 6; spacing: 6
-                        Rectangle { width: 20; height: 20; radius: 4; color: navColorSettings.carColor; border.color: "gray"; border.width: 1 }
-                        Label { text: tr("Tracé voiture"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
-                       // Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
+                    columns: 2
+                    columnSpacing: 8
+                    rowSpacing: 8
+
+                    // --- Tracé voiture ---
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 52
+                        color: "#259E9E9E"
+                        border.color: Theme.controlBorderColor; border.width: 1; radius: 6
+                        MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("car") }
+                        RowLayout {
+                            anchors.fill: parent; anchors.margins: 6; spacing: 6
+                            Rectangle { width: 20; height: 20; radius: 4; color: navColorSettings.carColor; border.color: "gray"; border.width: 1 }
+                            Label { text: tr("Tracé voiture"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                        }
+                    }
+
+                    // --- Tracé piéton ---
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 52
+                        color: "#259E9E9E"
+                        border.color: Theme.controlBorderColor; border.width: 1; radius: 6
+                        MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("foot") }
+                        RowLayout {
+                            anchors.fill: parent; anchors.margins: 6; spacing: 6
+                            Rectangle { width: 20; height: 20; radius: 4; color: navColorSettings.footColor; border.color: "gray"; border.width: 1 }
+                            Label { text: tr("Tracé piéton"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                        }
+                    }
+
+                    // --- Point de stationnement ---
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 52
+                        color: "#259E9E9E"
+                        border.color: Theme.controlBorderColor; border.width: 1; radius: 6
+                        MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("park") }
+                        RowLayout {
+                            anchors.fill: parent; anchors.margins: 6; spacing: 6
+                            Rectangle { width: 20; height: 20; radius: 10; color: navColorSettings.parkColor; border.color: "gray"; border.width: 1 }
+                            Label { text: tr("Stationnement"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                        }
+                    }
+
+                    // --- Points cibles ---
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 52
+                        color: "#259E9E9E"
+                        border.color: Theme.controlBorderColor; border.width: 1; radius: 6
+                        MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("target") }
+                        RowLayout {
+                            anchors.fill: parent; anchors.margins: 6; spacing: 6
+                            Rectangle { width: 20; height: 20; radius: 10; color: navColorSettings.targetColor; border.color: "gray"; border.width: 1 }
+                            Label { text: tr("Points cibles"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
+                        }
                     }
                 }
+                // --- FIN COULEURS ---
 
-                // --- Tracé piéton ---
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 52
-                    color: "#259E9E9E"
-                    border.color: Theme.controlBorderColor; border.width: 1; radius: 6
-                    MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("foot") }
-                    RowLayout {
-                        anchors.fill: parent; anchors.margins: 6; spacing: 6
-                        Rectangle { width: 20; height: 20; radius: 4; color: navColorSettings.footColor; border.color: "gray"; border.width: 1 }
-                        Label { text: tr("Tracé piéton"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
-                     //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 10
+                    Button {
+                        text: tr("ARRÊTER"); visible: isNavigating; Layout.fillWidth: true
+                        background: Rectangle { color: "#dc3545"; radius: 4 }
+                        contentItem: Text { text: parent.text; color: "white"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: { stopNavigation(); dialogNav.close() }
                     }
-                }
-
-                // --- Point de stationnement ---
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 52
-                    color: "#259E9E9E"
-                    border.color: Theme.controlBorderColor; border.width: 1; radius: 6
-                    MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("park") }
-                    RowLayout {
-                        anchors.fill: parent; anchors.margins: 6; spacing: 6
-                        Rectangle { width: 20; height: 20; radius: 10; color: navColorSettings.parkColor; border.color: "gray"; border.width: 1 }
-                        Label { text: tr("Stationnement"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
-                     //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
-                    }
-                }
-
-                // --- Points cibles ---
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 52
-                    color: "#259E9E9E"
-                    border.color: Theme.controlBorderColor; border.width: 1; radius: 6
-                    MouseArea { anchors.fill: parent; onClicked: colorWheelPopup.openFor("target") }
-                    RowLayout {
-                        anchors.fill: parent; anchors.margins: 6; spacing: 6
-                        Rectangle { width: 20; height: 20; radius: 10; color: navColorSettings.targetColor; border.color: "gray"; border.width: 1 }
-                        Label { text: tr("Points cibles"); font.pixelSize: 12; font.bold: true; color: Theme.mainTextColor; Layout.fillWidth: true }
-                     //   Text { text: "›"; font.pixelSize: 20; color: Theme.mainTextColor; rightPadding: 4 }
-                    }
-                }
-            }
-            // --- FIN COULEURS ---
-
-          //  Label { text: "2. Max walking distance:" }
-        //    QfComboBox {
-           //     id: walkThresholdSelector
-            //    Layout.fillWidth: true
-            //    model:["20 m", "30 m", "40 m", "50 m", "60 m", "70 m", "80 m"]
-             //   currentIndex: 3
-           //     enabled: false
-        //    }
-
-            RowLayout {
-                Layout.fillWidth: true; spacing: 10
-                Button {
-                    text: tr("ARRÊTER"); visible: isNavigating; Layout.fillWidth: true
-                    background: Rectangle { color: "#dc3545"; radius: 4 }
-                    contentItem: Text { text: parent.text; color: "white"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                    onClicked: { stopNavigation(); dialogNav.close() }
-                }
-                Button {
-                    text: tr("DÉMARRER"); visible: !isNavigating; Layout.fillWidth: true
-                    background: Rectangle { color: Theme.mainColor; radius: 4 }
-                    contentItem: Text { text: parent.text; color: "white"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                    onClicked: {
-                        if (layerSelector.currentText) {
-                            let l = getLayerByName(layerSelector.currentText)
-                            if(l) startNavigationProcess(l)
-                            dialogNav.close()
+                    // --- NOUVEAU CODE ---
+         Button {
+                        text: tr("DÉMARRER"); visible: !isNavigating; Layout.fillWidth: true
+                        background: Rectangle { color: Theme.mainColor; radius: 4 }
+                        contentItem: Text { text: parent.text; color: "white"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: {
+                            if (layerSelector.currentText) {
+                                let l = getLayerByName(layerSelector.currentText)
+                                if (l) {
+                                    pendingDriveMeLayer = l
+                                    
+                                    // CORRECTION ICI : on récupère la liste des entités sélectionnées
+                                    let selectedFeats = l.selectedFeatures()
+                                    
+                                    if (selectedFeats && selectedFeats.length > 0) {
+                                        // Si des entités sont sélectionnées, on prend leur emprise
+                                        pendingFeatExtent = l.boundingBoxOfSelected()
+                                    } else {
+                                        // Sinon, on prend l'emprise totale de la couche
+                                        // Note : en QML QField, l.extent est souvent une propriété
+                                        pendingFeatExtent = l.extent
+                                    }
+                                    
+                                    recenterTimer.restart()
+                                    dialogNav.close()
+                                }
+                            }
                         }
                     }
                 }
@@ -793,7 +952,7 @@ function getHudText() {
         }
     }
 
-    // --- 7. INITIALISATION ---
+    // --- 5d. FONCTIONS DIALOGUE ---
     function updateLayers() {
         let layers = ProjectUtils.mapLayers(qgisProject)
         let list = []
@@ -812,9 +971,14 @@ function getHudText() {
         return null
     }
 
+    // --- 6. NAVIGATION ---
     function stopNavigation() {
         isNavigating = false
-        // Nettoyage lignes
+        isPaused = false
+
+        hudMessagePersistent = false
+        hudMessage = ""
+
         let empty = GeometryUtils.createGeometryFromWkt("LINESTRING(0 0, 0.000001 0.000001)")
         if(empty) {
             carRenderer.geometryWrapper.qgsGeometry = empty
@@ -823,8 +987,6 @@ function getHudText() {
             polygonCenterRenderer.geometryWrapper.qgsGeometry = empty
             arrowRenderer.geometryWrapper.qgsGeometry = empty
         }
-        // Nettoyage marqueur voiture
-        // CORRECTION DE L'ERREUR ICI : On n'utilise pas createPoint, mais WKT
         let emptyPoint = GeometryUtils.createGeometryFromWkt("POINT(0 0)")
         if (emptyPoint) {
             carTransformer.sourcePosition = GeometryUtils.centroid(emptyPoint)
@@ -836,7 +998,6 @@ function getHudText() {
         polygonCenters = {}
         traveledCoords = []
 
-        iface.logMessage("Arrêt.", Qgis.Info)
         mapCanvas.refresh()
     }
 
@@ -844,17 +1005,14 @@ function getHudText() {
         try {
             chainWalkThreshold = 50
 
-            // Vérification sélection préexistante via selectedFeatures() (API QField confirmée)
             let preSelected = layer.selectedFeatures()
             let hasPreSelection = preSelected && preSelected.length > 0
+            
             let feats = []
 
             if (hasPreSelection) {
-                // Des entités sont déjà sélectionnées : on les utilise telles quelles
-                // On NE touche PAS à la sélection → le jaune reste affiché sur la carte
                 feats = preSelected
             } else {
-                // Aucune sélection préalable (couche points/lignes) : sélectionne tout puis nettoie
                 layer.selectAll()
                 feats = layer.selectedFeatures()
                 layer.removeSelection()
@@ -863,14 +1021,12 @@ function getHudText() {
             if (!feats || feats.length === 0) { showHudMessage(tr("Aucun élément trouvé")); return }
 
             if (hasPreSelection) {
-                // POLYGONES : point du bord le plus proche de la position de départ (Option B)
                 let startPos = getCurrentGpsPosition()
                 if (!startPos) startPos = getMapCenter()
                 let rawPoints = resolvePolygonBoundaryPoints(feats, layer, startPos)
                 if (rawPoints.length < 1) { showHudMessage(tr("Aucun point trouvé")); return }
                 proceedWithNavigation(rawPoints)
             } else {
-                // POINTS / LIGNES : centroïde de chaque entité, démarrage direct
                 let rawPoints = []
                 for (let i = 0; i < feats.length; i++) {
                     let g = feats[i].geometry
@@ -886,16 +1042,10 @@ function getHudText() {
                 proceedWithNavigation(rawPoints)
             }
 
-        } catch(e) {
-            iface.logMessage("Erreur startNav: " + e.toString(), Qgis.Critical)
-        }
+        } catch(e) {}
     }
 
     // --- OPTION B : sommet du polygone le plus proche de la route/parking, sinon de la position ---
-    // Aucun appel réseau — purement géométrique
-    // Priorité 1 : parkedLocation (distance à pied depuis parking)
-    // Priorité 2 : route OSRM (distance réelle au segment, couvre 2 côtés de route)
-    // Priorité 3 : position GPS (aucune route connue)
     function resolvePolygonBoundaryPoints(feats, layer, refPos) {
         let rawPoints = []
         let hasRoute = lastRouteCoords && lastRouteCoords.length >= 2
@@ -905,29 +1055,25 @@ function getHudText() {
             let g = feats[i].geometry
             if (!g) continue
 
-            // Fallback : centroïde en WGS84
             let centPt = GeometryUtils.centroid(g)
             if (!centPt) continue
             let wgsFallback = GeometryUtils.reprojectPointToWgs84(centPt, layer.crs)
             if (!wgsFallback) continue
             let fallback = { id: i, x: wgsFallback.x, y: wgsFallback.y, onRoute: false }
 
-                // Stocker le point intérieur du polygone : point_on_surface si dispo, sinon centroïde
-                try {
-                    let innerPt = GeometryUtils.pointOnSurface ? GeometryUtils.pointOnSurface(g) : null
-                    let innerWgs = innerPt ? GeometryUtils.reprojectPointToWgs84(innerPt, layer.crs) : null
-                    polygonCenters[i] = innerWgs ? { x: innerWgs.x, y: innerWgs.y } : { x: wgsFallback.x, y: wgsFallback.y }
-                } catch(e) {
-                    polygonCenters[i] = { x: wgsFallback.x, y: wgsFallback.y }
-                }
+            try {
+                let innerPt = GeometryUtils.pointOnSurface ? GeometryUtils.pointOnSurface(g) : null
+                let innerWgs = innerPt ? GeometryUtils.reprojectPointToWgs84(innerPt, layer.crs) : null
+                polygonCenters[i] = innerWgs ? { x: innerWgs.x, y: innerWgs.y } : { x: wgsFallback.x, y: wgsFallback.y }
+            } catch(e) {
+                polygonCenters[i] = { x: wgsFallback.x, y: wgsFallback.y }
+            }
 
             try {
-                // Extraire les sommets du contour extérieur via WKT
                 let wkt = g.asWkt()
                 let coords = parseOuterRingCoords(wkt)
                 if (!coords || coords.length < 2) { rawPoints.push(fallback); continue }
 
-                // Reprojeter tous les sommets en WGS84
                 let vertices = []
                 for (let j = 0; j < coords.length; j++) {
                     let vWkt = "POINT(" + coords[j][0] + " " + coords[j][1] + ")"
@@ -941,28 +1087,23 @@ function getHudText() {
                 }
                 if (vertices.length === 0) { rawPoints.push(fallback); continue }
 
-                // Stockage des sommets pour affinage ultérieur quand la route OSRM sera connue
                 polygonVertices[i] = vertices
 
                 let bestPt = null
                 let bestDist = 1e9
 
                 if (hasParking) {
-    // PRIORITÉ 1 : on est garé → sommet minimisant (distance parking + distance route)
-    for (let k = 0; k < vertices.length; k++) {
-        let dParking = getDistMeters(parkedLocation, vertices[k])
-        let dRoute = hasRoute ? minDistToRouteLine(vertices[k], lastRouteCoords) : 0
-        let d = dParking + dRoute
-        if (d < bestDist) { bestDist = d; bestPt = vertices[k] }
-    }
+                    for (let k = 0; k < vertices.length; k++) {
+                        let dParking = getDistMeters(parkedLocation, vertices[k])
+                        let dRoute = hasRoute ? minDistToRouteLine(vertices[k], lastRouteCoords) : 0
+                        let d = dParking + dRoute
+                        if (d < bestDist) { bestDist = d; bestPt = vertices[k] }
+                    }
                 } else if (hasRoute) {
-                    // PRIORITÉ 2 : sommet le plus proche de la route (projection réelle sur segments)
-                    // → trouve automatiquement le côté optimal si la route longe 2 bords du polygone
                     for (let k = 0; k < vertices.length; k++) {
                         let d = minDistToRouteLine(vertices[k], lastRouteCoords)
                         if (d < bestDist) { bestDist = d; bestPt = vertices[k] }
                     }
-                    // Si trop loin de la route (>200m) → pas de route carrossable proche
                     if (bestDist > 200) {
                         bestDist = 1e9; bestPt = null
                         for (let k = 0; k < vertices.length; k++) {
@@ -971,7 +1112,6 @@ function getHudText() {
                         }
                     }
                 } else {
-                    // PRIORITÉ 3 : aucune route connue → sommet le plus proche de la position GPS
                     for (let k = 0; k < vertices.length; k++) {
                         let d = getDistMeters(refPos || fallback, vertices[k])
                         if (d < bestDist) { bestDist = d; bestPt = vertices[k] }
@@ -980,24 +1120,18 @@ function getHudText() {
 
                 if (!bestPt) { rawPoints.push(fallback); continue }
 
-                // onRoute : sommet ≤ 20m de la route → accessible en voiture → flyby
                 let isOnRoute = hasRoute ? (minDistToRouteLine(bestPt, lastRouteCoords) < 20) : false
-                // isolated : tous les sommets à > 200m de toute route → sera chaîné au voisin accessible
                 let isIsolated = hasRoute && bestDist > 200
                 rawPoints.push({ id: i, x: bestPt.x, y: bestPt.y, onRoute: isOnRoute, isolated: isIsolated })
 
             } catch(e) {
-                rawPoints.push(fallback)  // fallback silencieux : centroïde
+                rawPoints.push(fallback)
             }
         }
-        // Chaîner les points isolés vers leur voisin accessible par route
         chainIsolatedPoints(rawPoints)
         return rawPoints
     }
 
-    // --- Distance minimale d'un point au segment de route le plus proche (projection réelle) ---
-    // Plus précis que nœud-par-nœud : trouve la vraie distance à pied minimale depuis n'importe
-    // quel endroit de la route — couvre le cas "polygone accessible depuis 2 routes différentes"
     function minDistToRouteLine(pt, routeCoords) {
         let coords = routeCoords || lastRouteCoords
         if (!coords || coords.length < 2) return 1e9
@@ -1008,39 +1142,33 @@ function getHudText() {
             let d = distPointToSegmentMeters(pt, a, b)
             if (d < minD) minD = d
         }
-        // Vérifier aussi le dernier nœud isolé
         let last = { x: coords[coords.length-1][0], y: coords[coords.length-1][1] }
         let dLast = getDistMeters(pt, last)
         if (dLast < minD) minD = dLast
         return minD
     }
 
-    // --- Distance d'un point à un segment AB (projection clampée sur [0,1]) ---
     function distPointToSegmentMeters(pt, a, b) {
         let dx = b.x - a.x
         let dy = b.y - a.y
         let lenSq = dx * dx + dy * dy
         if (lenSq < 1e-12) return getDistMeters(pt, a)
-        // Paramètre de projection t, clampé entre 0 et 1
         let t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq
         t = Math.max(0, Math.min(1, t))
         let proj = { x: a.x + t * dx, y: a.y + t * dy }
         return getDistMeters(pt, proj)
     }
 
-    // Raccourci : distance minimale à la route courante (lastRouteCoords)
     function minDistToRoute(pt) {
         return minDistToRouteLine(pt, lastRouteCoords)
     }
 
-    // --- Rendu des points rouges clignotants sur les points on-route encore non validés ---
     function updateOnRouteRenderer() {
         let onRoutePts = unvisitedPoints.filter(function(p) { return p.onRoute })
         if (onRoutePts.length === 0) {
             clearGeometry(onRouteRenderer)
             return
         }
-        // MULTIPOINT : chaque point devient un cercle rouge grâce à lineWidth: 14
         let pts = []
         for (let i = 0; i < onRoutePts.length; i++) {
             pts.push(onRoutePts[i].x.toFixed(6) + " " + onRoutePts[i].y.toFixed(6))
@@ -1050,14 +1178,10 @@ function getHudText() {
         if (geom) onRouteRenderer.geometryWrapper.qgsGeometry = geom
     }
 
-    // --- Parseur WKT : extrait les coordonnées du premier anneau extérieur ---
-    // Gère POLYGON((x y,...)) et MULTIPOLYGON(((x y,...)))
     function parseOuterRingCoords(wkt) {
         try {
-            // Supprimer le préfixe POLYGON ou MULTIPOLYGON et les premières parenthèses
             let cleaned = wkt.replace(/^MULTIPOLYGON\s*\(\s*\(\s*\(/, "((")
                               .replace(/^POLYGON\s*\(/, "(")
-            // Extraire le contenu du premier anneau entre parenthèses
             let match = cleaned.match(/\(([^)]+)\)/)
             if (!match) return null
             let pairs = match[1].trim().split(",")
@@ -1074,14 +1198,12 @@ function getHudText() {
         } catch(e) { return null }
     }
 
-    // --- DÉMARRAGE NAVIGATION : commun points/lignes et polygones ---
     function proceedWithNavigation(rawPoints) {
         if (rawPoints.length < 1) { showHudMessage(tr("Aucun point trouvé")); return }
 
         unvisitedPoints = rawPoints
         totalPointsCount = rawPoints.length
         
-        // Premier tri
         let startPos = getCurrentGpsPosition()
         if (!startPos) startPos = getMapCenter() 
         if (!startPos) startPos = rawPoints[0]
@@ -1092,12 +1214,10 @@ function getHudText() {
         isNavigating = true
         lastProcessPos = null
         
-        // Optimisation Trip en tache de fond
         if (unvisitedPoints.length >= 2 && unvisitedPoints.length < 50) {
             optimizeEntireTour(startPos)
         }
         
-        iface.logMessage("Nav démarrée.", Qgis.Info)
         updateNavigationLoop()
     }
 
@@ -1122,7 +1242,6 @@ function getHudText() {
                         if (newOrder.length === unvisitedPoints.length) {
                             unvisitedPoints = newOrder
                             currentTarget = unvisitedPoints[0]
-                            iface.logMessage("Tournée optimisée par OSRM.", Qgis.Success)
                         }
                     }
                 } catch(e) {}
@@ -1145,18 +1264,13 @@ function getHudText() {
     }
 
     function pickBestVertex(pt) {
-        // Si route connue → sommet le plus proche de la route
-        // Fallback : trajet GPS parcouru (traveledCoords) — évite la dépendance circulaire
-        // où la route est calculée vers le mauvais sommet et confirme ce même mauvais sommet
         let verts = polygonVertices[pt.id]
         if (!verts || verts.length === 0) return pt
 
-        // Choisir la référence : route Valhalla si dispo, sinon trajet GPS parcouru
         let refCoords = null
         if (lastRouteCoords && lastRouteCoords.length >= 2) {
             refCoords = lastRouteCoords
         } else if (traveledCoords && traveledCoords.length >= 2) {
-            // Convertir traveledCoords [{x,y}] en [[x,y]] pour minDistToRouteLine
             refCoords = traveledCoords.map(function(p) { return [p.x, p.y] })
         }
         if (!refCoords) return pt
@@ -1173,13 +1287,16 @@ function getHudText() {
 
     // --- 8. BOUCLE PRINCIPALE ---
     function updateNavigationLoop() {
-        if (!isNavigating) return
+        if (!isNavigating || isPaused) return
 
         let myPos = getCurrentGpsPosition()
-        if (!myPos) myPos = getMapCenter() 
+        if (!myPos) myPos = getCrosshairPosition()
         if (!myPos) return
 
-        // --- ENREGISTREMENT DU TRAJET PARCOURU (anti-demi-tour) ---
+        let crosshairPos = getCrosshairPosition()
+        let routePos = (crosshairPos && getDistMeters(myPos, crosshairPos) > 20) ? crosshairPos : myPos
+
+        // --- ENREGISTREMENT DU TRAJET PARCOURU ---
         if (navState === "DRIVING") {
             let lastTraveled = traveledCoords.length > 0 ? traveledCoords[traveledCoords.length - 1] : null
             if (!lastTraveled || getDistMeters(myPos, lastTraveled) > 15) {
@@ -1187,15 +1304,14 @@ function getHudText() {
             }
         }
 
-        // --- NOUVEAU : CALCUL DE LA DISTANCE POUR LE HUD ---
+        // --- CALCUL DE LA DISTANCE POUR LE HUD ---
         let targetDist = 0
         if (navState === "RETURNING_TO_CAR" && parkedLocation) {
-            targetDist = getDistMeters(myPos, parkedLocation)
+            targetDist = getDistMeters(routePos, parkedLocation)
         } else if (currentTarget) {
-            targetDist = getDistMeters(myPos, currentTarget)
+            targetDist = getDistMeters(routePos, currentTarget)
         }
         
-        // Formatage de la distance (Mètres ou Kilomètres)
         if (targetDist > 1000) {
             distanceText = (targetDist / 1000).toFixed(1) + " km"
         } else if (targetDist > 0) {
@@ -1203,18 +1319,16 @@ function getHudText() {
         } else {
             distanceText = "-- m"
         }
-        // --------------------------------------------------    
 
-        // FLYBY Validation — position actuelle + trajet déjà parcouru (anti-demi-tour)
+        // FLYBY Validation
         let targetWasValidated = false
-        let remainingPoints =[]
+        let remainingPoints = []
         let flybyRadius = (navState === "DRIVING" || navState === "RETURNING_TO_CAR") ? 15 : 10
 
         for (let i = 0; i < unvisitedPoints.length; i++) {
             let pt = unvisitedPoints[i]
-            // Vérification 1 : proximité immédiate (comportement original)
             let nearNow = getDistMeters(myPos, pt) <= flybyRadius
-            // Vérification 2 : le point onRoute est proche d'un endroit déjà parcouru (anti-demi-tour)
+                       || (crosshairPos && getDistMeters(crosshairPos, pt) <= flybyRadius)
             let nearTraveled = false
             if (!nearNow && pt.onRoute) {
                 for (let t = 0; t < traveledCoords.length; t++) {
@@ -1227,16 +1341,14 @@ function getHudText() {
             if (nearNow || nearTraveled) {
                 if (currentTarget && pt.id === currentTarget.id) {
                     targetWasValidated = true
-                    showHudMessage(tr("✅ Cible atteinte !"))
-                    // Ne garer la voiture que si le point suivant nécessite vraiment de marcher.
-                    // Si des points restants sont onRoute ou à portée de conduite → pas de parking.
+                    showHudMessage(tr("✅ Cible atteinte !"), true)
                     if (navState === "DRIVING") {
                         let nextPts = unvisitedPoints.filter(function(p) { return p.id !== pt.id })
-                        let needsPark = shouldParkHere(myPos, nextPts)
-                        if (needsPark) parkedLocation = { x: myPos.x, y: myPos.y }
+                        let needsPark = shouldParkHere(routePos, nextPts)
+                        if (needsPark) parkedLocation = { x: routePos.x, y: routePos.y }
                     }
                 } else {
-                    showHudMessage(tr("✅ Point validé\nau passage !"))
+                    showHudMessage(tr("✅ Point validé\nau passage !"), true)
                 }
             } else {
                 remainingPoints.push(pt)
@@ -1254,48 +1366,38 @@ function getHudText() {
                 showHudMessage(tr("Retour au véhicule."))
             } else if (navState !== "RETURNING_TO_CAR") {
                 stopNavigation()
-                showHudMessage(tr("🏁 Terminé !"))
+                showHudMessage(tr("🏁 Terminé !"), true)
                 return
             }
         } 
         else if (targetWasValidated || !currentTarget || !unvisitedPoints.find(p => p.id === currentTarget.id)) {
-            // Choix du prochain
             if (parkedLocation) {
-                // Privilégier les points onRoute (accessibles en voiture) même depuis le parking
-let onRoutePoints = unvisitedPoints.filter(function(p) { return p.onRoute && !p.isolated })
-let next = onRoutePoints.length > 0
-    ? getClosestPoint(myPos, onRoutePoints)
-    : getClosestPoint(myPos, unvisitedPoints)
-if (!next) {
+                let onRoutePoints = unvisitedPoints.filter(function(p) { return p.onRoute && !p.isolated })
+                let next = onRoutePoints.length > 0
+                    ? getClosestPoint(routePos, onRoutePoints)
+                    : getClosestPoint(routePos, unvisitedPoints)
+                if (!next) {
                     navState = "RETURNING_TO_CAR"
                 } else {
                     let pt = next.point
                     let distToNext = next.distance
-                    let distToParked = getDistMeters(myPos, parkedLocation)
+                    let distToParked = getDistMeters(routePos, parkedLocation)
 
-                    // Règle 1 — Point isolé (inaccessible en voiture) → toujours à pied
                     if (pt.isolated) {
                         currentTarget = pt
                         navState = "WALKING_TO_POI"
                         updatePolygonCenterRenderer()
                         updateArrowRenderer()
-                        showHudMessage(tr("Accès à pied\n(point isolé)"))
-
+                        showHudMessage(tr("Acc��s à pied\n(point isolé)"), true)
                     } else {
-                        // Règles 2/3/4 — Comparaison de temps : marcher vs retourner au véhicule
-                        // Vitesse marche : 1.2 m/s | Vitesse voiture : 8.3 m/s (30 km/h)
-                        // Distance voiture estimée = vol d'oiseau × 1.4 (facteur de détour typique)
-                        let walkSpeed  = 1.2   // m/s
-                        let driveSpeed = 8.3   // m/s
+                        let walkSpeed  = 1.2
+                        let driveSpeed = 8.3
 
                         let timeWalk = distToNext / walkSpeed
-
-                        // Temps voiture : retour à pied jusqu'à la voiture + trajet routier vers le sommet
                         let driveDistEst = getDistMeters(parkedLocation, pt) * 1.4
                         let timeCar  = distToParked / walkSpeed + driveDistEst / driveSpeed
 
                         if (timeWalk <= timeCar) {
-                            // Plus rapide à pied
                             currentTarget = pt
                             navState = "WALKING_TO_POI"
                             updatePolygonCenterRenderer()
@@ -1303,7 +1405,6 @@ if (!next) {
                             let saved = Math.round((timeCar - timeWalk) / 60)
                             showHudMessage(tr("👟 À pied plus rapide") + "\n(~" + saved + " " + tr("min gagnées") + ")")
                         } else {
-                            // Plus rapide en voiture
                             navState = "RETURNING_TO_CAR"
                             let saved = Math.round((timeWalk - timeCar) / 60)
                             showHudMessage(tr("🚗 Retour voiture") + "\n(~" + saved + " " + tr("min gagnées") + ")")
@@ -1311,30 +1412,28 @@ if (!next) {
                     }
                 }
             } else {
-    // Pas encore garé : sélection globale via /locate sur tous les sommets de toutes les géométries
-    // → pour chaque géométrie : meilleur sommet = celui le plus proche d'une route
-    // → parmi tous ces meilleurs sommets : choisir celui le plus proche de myPos
-    lastRouteCoords = null
-    currentTarget = null   // pas de cible provisoire — on attend /locate
-    navState = "DRIVING"
-    lastProcessPos = null
-    selectNextTarget(myPos, function(bestTarget) {
-        if (navState !== "DRIVING") return
-        if (!bestTarget) return
-        if (!unvisitedPoints.find(function(p) { return p.id === bestTarget.id })) return
-        currentTarget = bestTarget
-        unvisitedPoints = unvisitedPoints.map(function(p) { return p.id === bestTarget.id ? bestTarget : p })
-        updateOnRouteRenderer()
-        updatePolygonCenterRenderer()
-        updateArrowRenderer()
-        mapCanvas.refresh()
-    })
-   }
-}
+                lastRouteCoords = null
+                currentTarget = null
+                navState = "DRIVING"
+                lastProcessPos = null
+                selectNextTarget(routePos, function(bestTarget) {
+                    if (navState !== "DRIVING") return
+                    if (!bestTarget) return
+                    if (!unvisitedPoints.find(function(p) { return p.id === bestTarget.id })) return
+                    currentTarget = bestTarget
+                    unvisitedPoints = unvisitedPoints.map(function(p) { return p.id === bestTarget.id ? bestTarget : p })
+                    updateOnRouteRenderer()
+                    updatePolygonCenterRenderer()
+                    updateArrowRenderer()
+                    mapCanvas.refresh()
+                })
+            }
+        }
+
         if (unvisitedPoints.length === 0 && navState !== "RETURNING_TO_CAR") return
 
-// MAJ Marqueurs
-        let activeTarget = (navState === "RETURNING_TO_CAR" && parkedLocation) ? parkedLocation : currentTarget;
+        // MAJ Marqueurs
+        let activeTarget = (navState === "RETURNING_TO_CAR" && parkedLocation) ? parkedLocation : currentTarget
         if (activeTarget && activeTarget.x) {
             let wktTarget = "POINT(" + activeTarget.x + " " + activeTarget.y + ")"
             let g = GeometryUtils.createGeometryFromWkt(wktTarget)
@@ -1345,17 +1444,16 @@ if (!next) {
             let g = GeometryUtils.createGeometryFromWkt(wktCar)
             if(g) carTransformer.sourcePosition = GeometryUtils.centroid(g)
         } else {
-            // CORRECTION ERREUR : Utilisation WKT pour cacher le marqueur
             let emptyPoint = GeometryUtils.createGeometryFromWkt("POINT(0 0)")
             if(emptyPoint) carTransformer.sourcePosition = GeometryUtils.centroid(emptyPoint)
         }
 
-        // 5. TRACÉS
+        // TRACÉS
         var needsRefresh = false
 
         if (navState === "RETURNING_TO_CAR") {
             if (!parkedLocation) return
-            if (getDistMeters(myPos, parkedLocation) < 20) {
+            if (getDistMeters(routePos, parkedLocation) < 20) {
                 parkedLocation = null
                 navState = "DRIVING"
                 lastProcessPos = null
@@ -1365,148 +1463,251 @@ if (!next) {
                 updateNavigationLoop()
                 return
             }
-            if (!lastFootPos || getDistMeters(myPos, lastFootPos) > 3) {
-                lastFootPos = myPos
+            if (!lastFootPos || getDistMeters(routePos, lastFootPos) > 3) {
+                lastFootPos = routePos
                 clearGeometry(carRenderer)
-                drawDirectLine(myPos, parkedLocation, footRenderer)
+                drawDirectLine(routePos, parkedLocation, footRenderer)
                 needsRefresh = true
             }
         } 
-        else if (navState === "WALKING_TO_POI") {
-            if (!currentTarget) return
-            if (!lastFootPos || getDistMeters(myPos, lastFootPos) > 3) {
-                lastFootPos = myPos
-                clearGeometry(carRenderer)
-                drawDirectLine(myPos, currentTarget, footRenderer)
-                needsRefresh = true
-            }
+        // --- DANS updateNavigationLoop, section WALKING_TO_POI ---
+else if (navState === "WALKING_TO_POI") {
+    if (!currentTarget) return
+
+    // --- OPTIMISATION : vérifier accès route alternatif si trop loin de la voiture ---
+    let distFromCar = parkedLocation ? getDistMeters(parkedLocation, currentTarget) : 0
+
+    if (parkedLocation && distFromCar > 300 && !currentTarget.altChecked) {
+        // Marquer immédiatement pour éviter les appels répétés à chaque tick
+        let markedTarget = {
+            id:         currentTarget.id,
+            x:          currentTarget.x,
+            y:          currentTarget.y,
+            onRoute:    currentTarget.onRoute,
+            isolated:   currentTarget.isolated,
+            altChecked: true
         }
+        currentTarget = markedTarget
+        unvisitedPoints = unvisitedPoints.map(function(p) {
+            return p.id === markedTarget.id ? markedTarget : p
+        })
+
+        let snapTarget = markedTarget
+        checkAlternativeFootAccess(markedTarget, distFromCar, function(bestRoadDist, bestVert) {
+            // Vérifier qu'on est toujours en train de marcher vers ce même point
+            if (navState !== "WALKING_TO_POI") return
+            if (!currentTarget || currentTarget.id !== snapTarget.id) return
+
+            // Gain significatif (>100m de marche en moins) via une autre route ?
+            if (bestVert && bestRoadDist < distFromCar - 100) {
+                let gain = Math.round(distFromCar - bestRoadDist)
+                showHudMessage(tr("🔄 Retour voiture :\naccès route plus court(-") + gain + "m)", true)
+
+                // Mettre à jour le point avec le sommet le plus proche de la route
+                let updatedPt = {
+                    id:         snapTarget.id,
+                    x:          bestVert.x,
+                    y:          bestVert.y,
+                    onRoute:    bestRoadDist < 50,
+                    isolated:   bestRoadDist > 200,
+                    altChecked: true          // Ne plus re-vérifier
+                }
+                unvisitedPoints = unvisitedPoints.map(function(p) {
+                    return p.id === updatedPt.id ? updatedPt : p
+                })
+
+                currentTarget = null
+                navState = "RETURNING_TO_CAR"
+                updatePolygonCenterRenderer()
+                updateArrowRenderer()
+            }
+            // Sinon : pas d'alternative meilleure → on continue à pied, altChecked évite la re-vérif
+        })
+    }
+
+    // Si l'async vient de changer l'état, on ne redessine pas
+    if (navState !== "WALKING_TO_POI") return
+
+    if (!lastFootPos || getDistMeters(routePos, lastFootPos) > 3) {
+        lastFootPos = routePos
+        clearGeometry(carRenderer)
+        drawDirectLine(routePos, currentTarget, footRenderer)
+        needsRefresh = true
+    }
+}
         else if (navState === "DRIVING") {
             if (!currentTarget) return
             if (lastRouteCoords && lastRouteCoords.length >= 2) {
-                if (trimRouteToCurrentPos(myPos)) needsRefresh = true
+                if (trimRouteToCurrentPos(routePos)) needsRefresh = true
             }
-            if (!lastProcessPos || getDistMeters(myPos, lastProcessPos) > 40) {
-                lastProcessPos = myPos
-                fetchOsrmRoute(myPos, currentTarget)
+            if (!lastProcessPos || getDistMeters(routePos, lastProcessPos) > 40) {
+                lastProcessPos = routePos
+                fetchOsrmRoute(routePos, currentTarget)
             }
         }
 
         if (needsRefresh) mapCanvas.refresh()
     }
-    // --- Sélectionne la prochaine cible optimale via /locate Valhalla ---
-    // 1. Collecte tous les sommets de toutes les géométries restantes (non-isolées)
-    // 2. Un seul appel /locate → distance à la route pour chaque sommet
-    // 3. Pour chaque géométrie : garde le sommet le plus proche d'une route
-    // 4. Parmi ces meilleurs sommets : choisit celui le plus proche de myPos
-    // 5. Fallback pour les géométries sans sommets proches de route (isolées) : sommet le plus proche de myPos
-    function selectNextTarget(myPos, onDone) {
-        let snapNavState = navState
 
-        // Construire index : pour chaque sommet → quel pt (id, isolated)
-        let allVerts = []   // { vert: {x,y}, ptId, isolated }
-        for (let i = 0; i < unvisitedPoints.length; i++) {
-            let pt = unvisitedPoints[i]
-            if (pt.isolated) continue   // les isolés sont gérés séparément
-            let verts = polygonVertices[pt.id]
-            if (verts && verts.length > 0) {
-                for (let j = 0; j < verts.length; j++) {
-                    allVerts.push({ vert: verts[j], ptId: pt.id, isolated: false })
-                }
-            } else {
-                // Point/ligne : pas de polygonVertices → utiliser le point directement
-                allVerts.push({ vert: { x: pt.x, y: pt.y }, ptId: pt.id, isolated: false })
+    function selectNextTarget(pos, onDone) {
+    let snapNavState = navState
+    let allVerts = []
+
+    // 1. Collecte de tous les sommets/points
+    for (let i = 0; i < unvisitedPoints.length; i++) {
+        let pt = unvisitedPoints[i]
+        if (pt.isolated) continue // On ignore les points isolés pour le snapping route
+        let verts = polygonVertices[pt.id]
+        if (verts && verts.length > 0) {
+            for (let j = 0; j < verts.length; j++) {
+                allVerts.push({ vert: verts[j], ptId: pt.id })
             }
+        } else {
+            allVerts.push({ vert: { x: pt.x, y: pt.y }, ptId: pt.id })
         }
-
-        if (allVerts.length === 0) {
-            // Que des isolés → fallback simple
-            let fb = getClosestPoint(myPos, unvisitedPoints)
-            onDone(fb ? fb.point : null)
-            return
-        }
-
-        let locations = allVerts.map(function(e) { return { lon: e.vert.x, lat: e.vert.y } })
-        let body = JSON.stringify({ locations: locations, costing: "auto" })
-        let url = "https://valhalla1.openstreetmap.de/locate"
-
-        var req = new XMLHttpRequest()
-        req.timeout = 8000
-        req.ontimeout = function() {
-            // Fallback : géométrie la plus proche de myPos
-            let fb = getClosestPoint(myPos, unvisitedPoints.filter(function(p) { return !p.isolated }))
-            if (!fb) fb = getClosestPoint(myPos, unvisitedPoints)
-            onDone(fb ? fb.point : null)
-        }
-        req.onerror = req.ontimeout
-        req.onreadystatechange = function() {
-            if (req.readyState !== XMLHttpRequest.DONE) return
-            if (navState !== snapNavState) return
-            if (req.status === 200) {
-                try {
-                    let json = JSON.parse(req.responseText)
-
-                    // Étape 1 : pour chaque géométrie, trouver son sommet le plus proche d'une route
-                    // edges[0].distance est un ratio 0-1 le long du tronçon, PAS une distance en mètres
-                    // La vraie distance = getDistMeters(sommet_original, correlated_lat/lon)
-                    let bestPerPt = {}   // ptId → { vert, roadDist }
-                    for (let k = 0; k < json.length && k < allVerts.length; k++) {
-                        let entry = json[k]
-                        let roadDist = 1e9
-                        if (entry && entry.edges && entry.edges.length > 0) {
-                            let edge = entry.edges[0]
-                            if (edge.correlated_lat !== undefined && edge.correlated_lon !== undefined) {
-                                // Distance réelle entre le sommet et son snap sur la route
-                                roadDist = getDistMeters(
-                                    allVerts[k].vert,
-                                    { x: edge.correlated_lon, y: edge.correlated_lat }
-                                )
-                            }
-                        }
-                        let ptId = allVerts[k].ptId
-                        if (!bestPerPt[ptId] || roadDist < bestPerPt[ptId].roadDist) {
-                            bestPerPt[ptId] = { vert: allVerts[k].vert, roadDist: roadDist }
-                        }
-                    }
-
-                    // Étape 2 : parmi les meilleurs sommets par géométrie, choisir celui le plus proche de myPos
-                    // Ignorer les géométries dont le meilleur sommet est à > 200m d'une route (seront traitées en isolé)
-                    let bestTarget = null
-                    let bestScore = 1e9
-                    for (let ptId in bestPerPt) {
-                        let b = bestPerPt[ptId]
-                        let distToMe = getDistMeters(myPos, b.vert)
-                        // Géométries proches d'une route : score = distance à myPos
-                        // Géométries loin de toute route (> 200m) : ignorées ici → fallback isolé
-                        if (b.roadDist <= 200 && distToMe < bestScore) {
-                            bestScore = distToMe
-                            let pt = unvisitedPoints.find(function(p) { return p.id === parseInt(ptId) || p.id === ptId })
-                            if (pt) bestTarget = { id: pt.id, x: b.vert.x, y: b.vert.y, onRoute: b.roadDist < 20, isolated: pt.isolated }
-                        }
-                    }
-
-                    // Étape 3 : si aucune géométrie avec sommet proche route → fallback toutes géométries
-                    if (!bestTarget) {
-                        let fb = getClosestPoint(myPos, unvisitedPoints)
-                        bestTarget = fb ? fb.point : null
-                    }
-
-                    onDone(bestTarget)
-                    return
-                } catch(e) {}
-            }
-            // Erreur HTTP → fallback
-            let fb = getClosestPoint(myPos, unvisitedPoints)
-            onDone(fb ? fb.point : null)
-        }
-        req.open("POST", url)
-        req.setRequestHeader("Content-Type", "application/json")
-        req.send(body)
     }
 
-    // --- 9. ROUTAGE VALHALLA — costing auto + use_tracks:1 (chemins agricoles, pistes, voies carrossables) ---
+    if (allVerts.length === 0) {
+        let fb = getClosestPoint(pos, unvisitedPoints)
+        onDone(fb ? fb.point : null)
+        return
+    }
+
+    // 2. Appel à Valhalla pour localiser la route la plus proche de chaque point
+    let locations = allVerts.map(function(e) { return { lon: e.vert.x, lat: e.vert.y } })
+    let body = JSON.stringify({ locations: locations, costing: "auto" })
+    let url = "https://valhalla1.openstreetmap.de/locate"
+
+    var req = new XMLHttpRequest()
+    req.timeout = 8000
+    req.ontimeout = function() {
+        let fb = getClosestPoint(pos, unvisitedPoints); onDone(fb ? fb.point : null)
+    }
+    req.onerror = req.ontimeout
+    req.onreadystatechange = function() {
+        if (req.readyState !== XMLHttpRequest.DONE) return
+        if (navState !== snapNavState) return
+        if (req.status === 200) {
+            try {
+                let json = JSON.parse(req.responseText)
+                let bestPerPt = {}
+
+                // On analyse les résultats de Valhalla
+                for (let k = 0; k < json.length && k < allVerts.length; k++) {
+                    let entry = json[k]
+                    let roadDist = 1e9 // Distance entre le point et la route
+                    if (entry && entry.edges && entry.edges.length > 0) {
+                        let edge = entry.edges[0]
+                        if (edge.correlated_lat !== undefined && edge.correlated_lon !== undefined) {
+                            roadDist = getDistMeters(
+                                allVerts[k].vert,
+                                { x: edge.correlated_lon, y: edge.correlated_lat }
+                            )
+                        }
+                    }
+                    let ptId = allVerts[k].ptId
+                    if (!bestPerPt[ptId] || roadDist < bestPerPt[ptId].roadDist) {
+                        bestPerPt[ptId] = { vert: allVerts[k].vert, roadDist: roadDist }
+                    }
+                }
+
+                // --- LOGIQUE D'OPTIMISATION DU SCORE ---
+                let bestTarget = null
+                let bestScore = 1e9
+
+                for (let ptId in bestPerPt) {
+                    let b = bestPerPt[ptId]
+                    let distToMe = getDistMeters(pos, b.vert)
+                    
+                    /**
+                     * CALCUL DU SCORE INTELLIGENT :
+                     * On veut minimiser : Distance_GPS + (Distance_à_la_route * Facteur)
+                     * 
+                     * - Si b.roadDist est petit (< 30m) : le point est "en bord de route". Très attractif.
+                     * - Si b.roadDist est grand (> 200m) : le point demande une longue marche. 
+                     *   On lui donne une forte pénalité pour ne pas le choisir maintenant, 
+                     *   sauf si on est déjà garé juste à côté.
+                     */
+                    let roadPenalty = 0
+                    if (b.roadDist > 50) {
+                        roadPenalty = b.roadDist * 5 // On multiplie par 5 la distance de marche pour décourager
+                    }
+
+                    let currentScore = distToMe + roadPenalty
+
+                    if (currentScore < bestScore) {
+                        bestScore = currentScore
+                        let pt = unvisitedPoints.find(p => p.id === parseInt(ptId) || p.id === ptId)
+                        if (pt) {
+                            bestTarget = { 
+                                id: pt.id, 
+                                x: b.vert.x, 
+                                y: b.vert.y, 
+                                onRoute: b.roadDist < 30, // Taggué comme "accessible voiture" si < 30m
+                                roadDist: b.roadDist,      // On stocke la distance pour usage ultérieur
+                                isolated: pt.isolated 
+                            }
+                        }
+                    }
+                }
+
+                if (!bestTarget) {
+                    let fb = getClosestPoint(pos, unvisitedPoints)
+                    bestTarget = fb ? fb.point : null
+                }
+
+                onDone(bestTarget)
+                return
+            } catch(e) { console.log("Erreur parsing Valhalla: " + e) }
+        }
+        let fb = getClosestPoint(pos, unvisitedPoints); onDone(fb ? fb.point : null)
+    }
+    req.open("POST", url)
+    req.setRequestHeader("Content-Type", "application/json")
+    req.send(body)
+}
+
+    function checkAlternativeFootAccess(target, currentWalkDist, onResult) {
+    let verts = polygonVertices[target.id]
+    if (!verts || verts.length === 0) { onResult(currentWalkDist, null); return }
+
+    let locations = verts.map(function(v) { return { lon: v.x, lat: v.y } })
+    let body = JSON.stringify({ locations: locations, costing: "auto" })
+
+    var req = new XMLHttpRequest()
+    req.timeout = 5000
+    req.ontimeout = function() { onResult(currentWalkDist, null) }
+    req.onerror   = req.ontimeout
+    req.onreadystatechange = function() {
+        if (req.readyState !== XMLHttpRequest.DONE) return
+        if (req.status === 200) {
+            try {
+                let json = JSON.parse(req.responseText)
+                let bestRoadDist = 1e9
+                let bestVert = null
+                for (let k = 0; k < json.length && k < verts.length; k++) {
+                    let entry = json[k]
+                    if (entry && entry.edges && entry.edges.length > 0) {
+                        let edge = entry.edges[0]
+                        if (edge.correlated_lat !== undefined && edge.correlated_lon !== undefined) {
+                            let rd = getDistMeters(verts[k],
+                                { x: edge.correlated_lon, y: edge.correlated_lat })
+                            if (rd < bestRoadDist) { bestRoadDist = rd; bestVert = verts[k] }
+                        }
+                    }
+                }
+                onResult(bestRoadDist, bestVert); return
+            } catch(e) {}
+        }
+        onResult(currentWalkDist, null)
+    }
+    req.open("POST", "https://valhalla1.openstreetmap.de/locate")
+    req.setRequestHeader("Content-Type", "application/json")
+    req.send(body)
+}
+
+    // --- 9. ROUTAGE VALHALLA ---
     function fetchOsrmRoute(start, end) {
-        // (guard onRoute supprimé : refinePolygonTargetsFromRoute doit toujours pouvoir corriger le sommet)
         let snapNavState = navState
         let snapTarget = currentTarget
         valhallaRequest(start, end, snapNavState, snapTarget, function(coords, snap, distOffRoad) {
@@ -1515,7 +1716,6 @@ if (!next) {
         })
     }
 
-    // Décode le polyline6 de Valhalla en tableau [[lon, lat], ...]
     function decodePolyline6(encoded) {
         let coords = []
         let index = 0, lat = 0, lng = 0
@@ -1536,7 +1736,7 @@ if (!next) {
             } while (b >= 0x20)
             let dlng = (result & 1) ? ~(result >> 1) : (result >> 1)
             lng += dlng
-            coords.push([lng / 1e6, lat / 1e6])  // [lon, lat] — même ordre qu'OSRM
+            coords.push([lng / 1e6, lat / 1e6])
         }
         return coords
     }
@@ -1551,7 +1751,7 @@ if (!next) {
             costing: "auto",
             costing_options: {
                 auto: {
-                    use_tracks: 1.0,    // accepter les chemins agricoles et pistes carrossables
+                    use_tracks: 1.0,
                     use_roads:  0.8,
                     use_ferry:  0.0,
                     top_speed:  80
@@ -1589,7 +1789,6 @@ if (!next) {
     function applyRouteResult(start, end, coords, snap, distOffRoad, snapNavState, snapTarget) {
         if (!coords) { drawDirectLine(start, end, carRenderer); return }
         if (navState !== snapNavState || currentTarget !== snapTarget) return
-        // Prolonger la route de 10m au-delà du point cible
         let extCoords = coords
         if (coords.length >= 2) {
             let p1 = coords[coords.length - 2]
@@ -1598,7 +1797,6 @@ if (!next) {
             let dy = p2[1] - p1[1]
             let segLen = getDistMeters({ x: p1[0], y: p1[1] }, { x: p2[0], y: p2[1] })
             if (segLen > 0) {
-                // 10m en degrés (approximation : 1 degré ≈ 111320m en lat, cos(lat)*111320 en lon)
                 let mPerDegLat = 111320
                 let mPerDegLon = Math.cos(p2[1] * Math.PI / 180) * 111320
                 let extLon = p2[0] + (dx / segLen) * (10 / mPerDegLon)
@@ -1618,7 +1816,7 @@ if (!next) {
                 lastFootPos = null
                 updatePolygonCenterRenderer()
                 updateArrowRenderer()
-                showHudMessage(tr("Fin de route.\nFinir à pied."))
+                showHudMessage(tr("Fin de route.\nFinir à pied."), true)
             }
         } else {
             routeHasFootSegment = false
@@ -1627,16 +1825,10 @@ if (!next) {
         mapCanvas.refresh()
     } 
 
-    // --- AFFINAGE POST-ROUTE : re-évalue les sommets polygon contre la route réelle ---
-    // Même priorité que resolvePolygonBoundaryPoints : parking > route > GPS
-    // Utilise minDistToRouteLine (projection sur segments) pour couvrir les 2 côtés de route
     function refinePolygonTargetsFromRoute(routeCoords, snap) {
         if (!routeCoords || routeCoords.length < 2) return
         let hasParking = parkedLocation && parkedLocation.x
 
-        // Construire refCoords : routeCoords en coupant les derniers 30m
-        // Construire refCoords : routeCoords en coupant les derniers 120m
-        // → conserve la partie centrale qui longe la vraie voirie près des bons sommets
         let refCoords = routeCoords
         let cumDist = 0
         for (let i = routeCoords.length - 2; i >= 1; i--) {
@@ -1657,7 +1849,6 @@ if (!next) {
             let bestDist = 1e9
 
             if (hasParking) {
-                // PRIORITÉ 1 : garé → sommet minimisant (distance parking + distance à la route)
                 for (let j = 0; j < verts.length; j++) {
                     let dParking = getDistMeters(parkedLocation, verts[j])
                     let dRoute = minDistToRouteLine(verts[j], refCoords)
@@ -1665,7 +1856,6 @@ if (!next) {
                     if (d < bestDist) { bestDist = d; bestPt = verts[j] }
                 }
             } else {
-                // PRIORITÉ 2 : sommet le plus proche de la route (hors les 30 derniers mètres)
                 for (let j = 0; j < verts.length; j++) {
                     let d = minDistToRouteLine(verts[j], refCoords)
                     if (d < bestDist) { bestDist = d; bestPt = verts[j] }
@@ -1675,7 +1865,6 @@ if (!next) {
 
             if (!bestPt) return pt
 
-            // onRoute : sommet ≤ 20m de la route tronquée
             let isOnRoute = minDistToRouteLine(bestPt, refCoords) < 20
             return { id: pt.id, x: bestPt.x, y: bestPt.y, onRoute: isOnRoute, isolated: pt.isolated }
         })
@@ -1690,23 +1879,18 @@ if (!next) {
         updateArrowRenderer()
         mapCanvas.refresh()
     }
-    // --- Chaîne les polygones isolés vers le sommet du voisin le plus proche accessible ---
-    // Polygone isolé : tous ses sommets à > 200m de toute route connue.
-    // On le rattache à son polygone voisin accessible le plus proche :
-    //   → sommet de l'isolé le plus proche du voisin = point d'approche
-    //   → OSRM atteindra la zone, le tronçon à pied fera le reste
+
     function chainIsolatedPoints(rawPoints) {
         let isolated = rawPoints.filter(function(p) { return p.isolated })
         if (isolated.length === 0) return
         let accessible = rawPoints.filter(function(p) { return !p.isolated })
-        if (accessible.length === 0) return  // tout est isolé → on ne peut pas chaîner
+        if (accessible.length === 0) return
 
         for (let i = 0; i < isolated.length; i++) {
             let iso = isolated[i]
             let isoVerts = polygonVertices[iso.id]
             if (!isoVerts || isoVerts.length === 0) continue
 
-            // Trouver le voisin accessible dont un sommet est le plus proche d'un sommet de l'isolé
             let bestNeighborVert = null
             let bestPairDist = 1e9
             let bestIsoVert = null
@@ -1728,7 +1912,6 @@ if (!next) {
             }
             if (!bestIsoVert) continue
 
-            // Mettre à jour la position de navigation de l'isolé vers son point d'approche
             let idx = rawPoints.indexOf(iso)
             if (idx >= 0) {
                 rawPoints[idx] = {
@@ -1743,74 +1926,63 @@ if (!next) {
         }
     }
 
-    // --- Décide si on doit garer la voiture ici ou continuer en voiture ---
-    // Retourne true uniquement si le prochain point nécessite vraiment de marcher :
-    //   - aucun point restant n'est onRoute (accessible en voiture)
-    //   - ET le point le plus proche est trop loin pour la marche depuis la route
     function shouldParkHere(myPos, remainingPts) {
-        if (!remainingPts || remainingPts.length === 0) return false
-        let next = getClosestPoint(myPos, remainingPts)
-        if (!next) return false
-        let pt = next.point
-
-        // Point isolé → toujours se garer et marcher (voiture ne peut pas y aller)
-        if (pt.isolated) return true
-
-        // Point sur la route courante à ≤ 30m → se garer et marcher
-       // if (pt.onRoute && next.distance <= 30) return true
-
-        // Toutes les autres situations → reprendre la voiture (ne pas créer de parking)
-        return false
-    }
-
-    // --- Rendu fuschia : centroïdes des points onRoute + centroïde de la cible à pied courante ---
-    function updatePolygonCenterRenderer() {
-    let empty = GeometryUtils.createGeometryFromWkt("LINESTRING(0 0, 0.000001 0.000001)")
-    // Points onRoute sur l'itinéraire
-    let candidates = unvisitedPoints.filter(function(p) { return p.onRoute })
-    // Ajouter la cible active si on marche vers elle (même si pas onRoute)
-    if (navState === "WALKING_TO_POI" && currentTarget &&
-        !candidates.find(function(p) { return p.id === currentTarget.id })) {
-        candidates = candidates.concat([currentTarget])
-    }
-    if (candidates.length === 0) {
-        if (empty) polygonCenterRenderer.geometryWrapper.qgsGeometry = empty
-        return
-    }
-    let polygons = []
-    for (let i = 0; i < candidates.length; i++) {
-        let verts = polygonVertices[candidates[i].id]
-        if (!verts || verts.length < 3) continue
-        // Construire l'anneau extérieur et le fermer si nécessaire
-        let ring = verts.map(function(v) { return v.x.toFixed(6) + " " + v.y.toFixed(6) })
-        let first = verts[0], last = verts[verts.length - 1]
-        if (first.x !== last.x || first.y !== last.y) {
-            ring.push(first.x.toFixed(6) + " " + first.y.toFixed(6))
-        }
-        polygons.push("((" + ring.join(",") + "))")
-    }
-    if (polygons.length === 0) {
-        if (empty) polygonCenterRenderer.geometryWrapper.qgsGeometry = empty
-        return
-    }
-    let wkt = polygons.length === 1
-        ? "POLYGON" + polygons[0]
-        : "MULTIPOLYGON(" + polygons.join(",") + ")"
-    let geom = GeometryUtils.createGeometryFromWkt(wkt)
-    if (geom) polygonCenterRenderer.geometryWrapper.qgsGeometry = geom
+    if (!remainingPts || remainingPts.length === 0) return false
+    let next = getClosestPoint(myPos, remainingPts)
+    let pt = next.point
+    
+    // Ne pas stationner si le point le plus proche est à plus de 400m 
+    // alors qu'on est encore en voiture
+    if (next.distance > 400 && navState === "DRIVING") return false;
+    
+    if (pt.isolated) return true
+    return false
 }
+
+    // --- Rendu fuschia ---
+    function updatePolygonCenterRenderer() {
+        let empty = GeometryUtils.createGeometryFromWkt("LINESTRING(0 0, 0.000001 0.000001)")
+        let candidates = unvisitedPoints.filter(function(p) { return p.onRoute })
+        if (navState === "WALKING_TO_POI" && currentTarget &&
+            !candidates.find(function(p) { return p.id === currentTarget.id })) {
+            candidates = candidates.concat([currentTarget])
+        }
+        if (candidates.length === 0) {
+            if (empty) polygonCenterRenderer.geometryWrapper.qgsGeometry = empty
+            return
+        }
+        let polygons = []
+        for (let i = 0; i < candidates.length; i++) {
+            let verts = polygonVertices[candidates[i].id]
+            if (!verts || verts.length < 3) continue
+            let ring = verts.map(function(v) { return v.x.toFixed(6) + " " + v.y.toFixed(6) })
+            let first = verts[0], last = verts[verts.length - 1]
+            if (first.x !== last.x || first.y !== last.y) {
+                ring.push(first.x.toFixed(6) + " " + first.y.toFixed(6))
+            }
+            polygons.push("((" + ring.join(",") + "))")
+        }
+        if (polygons.length === 0) {
+            if (empty) polygonCenterRenderer.geometryWrapper.qgsGeometry = empty
+            return
+        }
+        let wkt = polygons.length === 1
+            ? "POLYGON" + polygons[0]
+            : "MULTIPOLYGON(" + polygons.join(",") + ")"
+        let geom = GeometryUtils.createGeometryFromWkt(wkt)
+        if (geom) polygonCenterRenderer.geometryWrapper.qgsGeometry = geom
+    }
 
     function updateArrowRenderer() {
-    let empty = GeometryUtils.createGeometryFromWkt("LINESTRING(0 0, 0.000001 0.000001)")
-    if (empty) arrowRenderer.geometryWrapper.qgsGeometry = empty
-}
+        let empty = GeometryUtils.createGeometryFromWkt("LINESTRING(0 0, 0.000001 0.000001)")
+        if (empty) arrowRenderer.geometryWrapper.qgsGeometry = empty
+    }
 
     // --- 10. DESSIN ---
     function drawDirectLine(start, end, renderer) {
         let wkt = "LINESTRING(" + start.x.toFixed(6) + " " + start.y.toFixed(6) + ", " + end.x.toFixed(6) + " " + end.y.toFixed(6) + ")"
         let geom = GeometryUtils.createGeometryFromWkt(wkt)
         if(geom) renderer.geometryWrapper.qgsGeometry = geom
-       // mapCanvas.refresh()
     }
 
     function drawLineFromCoords(coords, renderer) {
@@ -1827,54 +1999,82 @@ if (!next) {
         if(empty) renderer.geometryWrapper.qgsGeometry = empty
     }
 
-    function trimRouteToCurrentPos(myPos) {
-    if (!lastRouteCoords || lastRouteCoords.length < 2) return false
-    let minDist = 1e9
-    let closestIdx = 0
-    for (let i = 0; i < lastRouteCoords.length; i++) {
-        let pt = { x: lastRouteCoords[i][0], y: lastRouteCoords[i][1] }
-        let d = getDistMeters(myPos, pt)
-        if (d < minDist) { minDist = d; closestIdx = i }
+    function trimRouteToCurrentPos(pos) {
+        if (!lastRouteCoords || lastRouteCoords.length < 2) return false
+        let minDist = 1e9
+        let closestIdx = 0
+        for (let i = 0; i < lastRouteCoords.length; i++) {
+            let pt = { x: lastRouteCoords[i][0], y: lastRouteCoords[i][1] }
+            let d = getDistMeters(pos, pt)
+            if (d < minDist) { minDist = d; closestIdx = i }
+        }
+
+        if (routeHasFootSegment) {
+            let remainingDist = 0
+            for (let j = closestIdx; j < lastRouteCoords.length - 1; j++) {
+                remainingDist += getDistMeters(
+                    { x: lastRouteCoords[j][0],   y: lastRouteCoords[j][1] },
+                    { x: lastRouteCoords[j+1][0], y: lastRouteCoords[j+1][1] }
+                )
+            }
+            if (remainingDist < 10 && navState === "DRIVING") {
+                parkedLocation = { x: pos.x, y: pos.y }
+                currentTarget = pickBestVertex(currentTarget)
+                navState = "WALKING_TO_POI"
+                routeHasFootSegment = false
+                updatePolygonCenterRenderer()
+                updateArrowRenderer()
+                showHudMessage(tr("Voiture stationnée.\nFinir à pied."), true)
+                return true
+            }
+        }
+
+        if (closestIdx === 0) return false
+        let remaining = lastRouteCoords.slice(closestIdx)
+        lastRouteCoords = remaining
+        if (remaining.length >= 2) {
+            drawLineFromCoords(remaining, carRenderer)
+        }
+        return true
     }
 
-    // Auto-parking : si tracé restant < 60m et qu'il y a un tronçon à pied
-    if (routeHasFootSegment) {
-        let remainingDist = 0
-        for (let j = closestIdx; j < lastRouteCoords.length - 1; j++) {
-            remainingDist += getDistMeters(
-                { x: lastRouteCoords[j][0],   y: lastRouteCoords[j][1] },
-                { x: lastRouteCoords[j+1][0], y: lastRouteCoords[j+1][1] }
-            )
-        }
-        if (remainingDist < 10 && navState === "DRIVING") {
-            parkedLocation = { x: myPos.x, y: myPos.y }
-            currentTarget = pickBestVertex(currentTarget)
-            navState = "WALKING_TO_POI"
-            routeHasFootSegment = false
-            updatePolygonCenterRenderer()
-            updateArrowRenderer()
-            showHudMessage(tr("Voiture stationnée.\nFinir à pied."))
-            return true
-        }
-    }
-
-    if (closestIdx === 0) return false
-    let remaining = lastRouteCoords.slice(closestIdx)
-    lastRouteCoords = remaining
-    if (remaining.length >= 2) {
-        drawLineFromCoords(remaining, carRenderer)
-    }
-    return true
-}
     // --- 11. UTILS ---
     function getCurrentGpsPosition() {
+        // Tentative 1 : iface.positionSource
         if (iface.positionSource && iface.positionSource.active) {
             let gpsPt = iface.positionSource.sourcePosition
-            if (gpsPt && (gpsPt.x !== 0 || gpsPt.y !== 0)) return { x: gpsPt.x, y: gpsPt.y }
+            if (gpsPt && (gpsPt.x !== 0 || gpsPt.y !== 0)) {
+                return { x: gpsPt.x, y: gpsPt.y }
+            }
         }
+        // Tentative 2 : locator.positionInformation
+        try {
+            let locatorItem = iface.findItemByObjectName("locator")
+            if (locatorItem && locatorItem.positionInformation) {
+                let pi = locatorItem.positionInformation
+                if (pi.latitude !== undefined && pi.longitude !== undefined
+                        && (pi.latitude !== 0 || pi.longitude !== 0)) {
+                    return { x: pi.longitude, y: pi.latitude }
+                }
+            }
+        } catch(e) {}
+        // Tentative 3 : navigation.location (QgsPoint C++ en CRS carte → reprojeter en WGS84)
+        try {
+            let navItem = iface.findItemByObjectName("navigation")
+            if (navItem && navItem.location) {
+                let loc = navItem.location
+                if ((loc.x !== 0 || loc.y !== 0)) {
+                    let wgs = GeometryUtils.reprojectPointToWgs84(loc, mapCanvas.mapSettings.destinationCrs)
+                    if (wgs && (wgs.x !== 0 || wgs.y !== 0)) {
+                        return { x: wgs.x, y: wgs.y }
+                    }
+                }
+            }
+        } catch(e) {}
+        
         return null
     }
-    
+
     function getMapCenter() {
         let extent = mapCanvas.mapSettings.extent
         let cx = (extent.xMinimum + extent.xMaximum) / 2
@@ -1887,6 +2087,18 @@ if (!next) {
             if (w) return { x: w.x, y: w.y }
         }
         return null
+    }
+
+    function getCrosshairPosition() {
+        try {
+            let locatorItem = iface.findItemByObjectName("locator")
+            if (locatorItem && locatorItem.currentCoordinate) {
+                let coord = locatorItem.currentCoordinate
+                let wgs = GeometryUtils.reprojectPointToWgs84(coord, mapCanvas.mapSettings.destinationCrs)
+                if (wgs && (wgs.x !== 0 || wgs.y !== 0)) return { x: wgs.x, y: wgs.y }
+            }
+        } catch(e) {}
+        return getMapCenter()
     }
 
     function getDistMeters(pt1, pt2) {
