@@ -44,6 +44,11 @@ Item {
     property var pendingDriveMeLayer: null
     property var pendingFeatExtent: null
 
+    // --- RAYON DE MARCHE ---
+    property real walkRadius: 200          // jamais marcher à plus de 200m du parking
+    property var lastFootRouteCoords: null // route piétonne calculée une seule fois
+    property bool targetJustValidated: false
+
     // --- COULEURS CONFIGURABLES ---
     property string _editingKey: ""
 
@@ -54,6 +59,7 @@ Item {
         property string footColor:   "#FF9500"
         property string parkColor:   "#00FF00"
         property string targetColor: "#FF0000"
+        property string targetgeomColor: "#cyan"
     }
 
     // --- COLOR WHEEL PICKER (partagé pour les 4 couleurs) ---
@@ -385,7 +391,14 @@ Item {
         "Tracé piéton":                          { "fr": "Tracé piéton",                          "en": "Walk route" },
         "Stationnement":                         { "fr": "Stationnement",                         "en": "Parking" },
         "Points cibles":                         { "fr": "Points cibles",                         "en": "Target points" },
-        "Annuler":                               { "fr": "Annuler",                               "en": "Cancel" }
+        "Annuler":                               { "fr": "Annuler",                               "en": "Cancel" },
+        "👟 ":                                   { "fr": "👟 ",                                   "en": "👟 " },
+        " point(s) dans rayon 200m":             { "fr": " point(s) dans rayon 200m",             "en": " point(s) within 200m" },
+        "👟 Prochain dans rayon\n(":             { "fr": "👟 Prochain dans rayon\n(",             "en": "👟 Next in radius\n(" },
+        " restant(s))":                          { "fr": " restant(s))",                          "en": " remaining)" },
+        "✅ Rayon terminé.\nRetour véhicule.":   { "fr": "✅ Rayon terminé.\nRetour véhicule.",   "en": "✅ Zone done.\nReturn to vehicle." },
+        "🚗 Hors rayon 200m.\nRetour véhicule.":{ "fr": "🚗 Hors rayon 200m.\nRetour véhicule.","en": "🚗 Outside 200m.\nReturn to vehicle." },
+        "🚗 Point route dans rayon.\nRetour véhicule.": { "fr": "🚗 Point route dans rayon.\nRetour véhicule.", "en": "🚗 Road point in radius.\nReturn to vehicle." }
     }
 
     function tr(key) {
@@ -408,7 +421,7 @@ Item {
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 6
         color: navColorSettings.carColor
-        opacity: 0.8
+        opacity: 1.0
     }
 
     QFieldItems.GeometryRenderer {
@@ -418,7 +431,7 @@ Item {
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 5
         color: navColorSettings.footColor
-        opacity: 0.9
+        opacity: 1.0
     }
 
     QFieldItems.GeometryRenderer {
@@ -428,7 +441,7 @@ Item {
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 14
         color: navColorSettings.targetColor
-        opacity: 0.9
+        opacity: 1.0
         SequentialAnimation on opacity {
             loops: Animation.Infinite
             running: isNavigating
@@ -443,8 +456,8 @@ Item {
         mapSettings: mapCanvas.mapSettings
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 4
-        color: "#FF00FF" // Fuschia — centre du polygone lié à la cible rouge courante
-        opacity: 0.9
+        color: "cyan" // Fuschia — centre du polygone lié à la cible rouge courante
+        opacity: 1.0
         SequentialAnimation on opacity {
             loops: Animation.Infinite
             running: isNavigating
@@ -459,7 +472,7 @@ Item {
         mapSettings: mapCanvas.mapSettings
         geometryWrapper.crs: CoordinateReferenceSystemUtils.wgs84Crs()
         lineWidth: 2
-        color: "#FF00FF" // Fuschia fin — flèches sommet rouge → centroïde fuschia
+        color: "cyan" // Fuschia fin — flèches sommet rouge → centroïde fuschia
         opacity: 0.75
     }
 
@@ -644,6 +657,16 @@ Item {
                 hudMessage = ""
         }
     }
+
+    Timer {
+        id: resetPolygonTimer
+        interval: 50        // 50ms — imperceptible mais suffit à reset l'animation
+        repeat: false
+        onTriggered: {
+            updatePolygonCenterRenderer()
+        }
+    }
+
 
     function showHudMessage(text, persistent) {
         hudMessagePersistent = (persistent === true)   
@@ -994,6 +1017,7 @@ Item {
         lastRouteCoords = null
         routeHasFootSegment = false
         lastFootPos = null
+        lastFootRouteCoords = null
         polygonVertices = {}
         polygonCenters = {}
         traveledCoords = []
@@ -1021,6 +1045,7 @@ Item {
             if (!feats || feats.length === 0) { showHudMessage(tr("Aucun élément trouvé")); return }
 
             if (hasPreSelection) {
+                layer.removeSelection()
                 let startPos = getCurrentGpsPosition()
                 if (!startPos) startPos = getMapCenter()
                 let rawPoints = resolvePolygonBoundaryPoints(feats, layer, startPos)
@@ -1213,6 +1238,7 @@ Item {
         parkedLocation = null
         isNavigating = true
         lastProcessPos = null
+        lastFootRouteCoords = null
         
         if (unvisitedPoints.length >= 2 && unvisitedPoints.length < 50) {
             optimizeEntireTour(startPos)
@@ -1329,6 +1355,21 @@ Item {
             let pt = unvisitedPoints[i]
             let nearNow = getDistMeters(myPos, pt) <= flybyRadius
                        || (crosshairPos && getDistMeters(crosshairPos, pt) <= flybyRadius)
+
+            // Vérifier aussi tous les sommets du polygone de la géométrie
+            if (!nearNow) {
+                let verts = polygonVertices[pt.id]
+                if (verts && verts.length > 0) {
+                    for (let v = 0; v < verts.length; v++) {
+                        if (getDistMeters(myPos, verts[v]) <= flybyRadius
+                            || (crosshairPos && getDistMeters(crosshairPos, verts[v]) <= flybyRadius)) {
+                            nearNow = true
+                            break
+                        }
+                    }
+                }
+            }
+
             let nearTraveled = false
             if (!nearNow && pt.onRoute) {
                 for (let t = 0; t < traveledCoords.length; t++) {
@@ -1336,6 +1377,17 @@ Item {
                         nearTraveled = true
                         break
                     }
+                    // Vérifier aussi les sommets pour le trajet parcouru
+                    let verts2 = polygonVertices[pt.id]
+                    if (verts2 && verts2.length > 0) {
+                        for (let v = 0; v < verts2.length; v++) {
+                            if (getDistMeters(traveledCoords[t], verts2[v]) <= flybyRadius) {
+                                nearTraveled = true
+                                break
+                            }
+                        }
+                    }
+                    if (nearTraveled) break
                 }
             }
             if (nearNow || nearTraveled) {
@@ -1345,7 +1397,10 @@ Item {
                     if (navState === "DRIVING") {
                         let nextPts = unvisitedPoints.filter(function(p) { return p.id !== pt.id })
                         let needsPark = shouldParkHere(routePos, nextPts)
-                        if (needsPark) parkedLocation = { x: routePos.x, y: routePos.y }
+                        if (needsPark) {
+                            parkedLocation = { x: routePos.x, y: routePos.y }
+                            lastFootRouteCoords = null
+                        }
                     }
                 } else {
                     showHudMessage(tr("✅ Point validé\nau passage !"), true)
@@ -1355,6 +1410,10 @@ Item {
             }
         }
         unvisitedPoints = remainingPoints
+        // Signaler la validation pour forcer le redémarrage visuel
+        if (targetWasValidated) {
+            targetJustValidated = true
+        }
         updateOnRouteRenderer()
         updatePolygonCenterRenderer()
         updateArrowRenderer()
@@ -1372,43 +1431,68 @@ Item {
         } 
         else if (targetWasValidated || !currentTarget || !unvisitedPoints.find(p => p.id === currentTarget.id)) {
             if (parkedLocation) {
-                let onRoutePoints = unvisitedPoints.filter(function(p) { return p.onRoute && !p.isolated })
-                let next = onRoutePoints.length > 0
-                    ? getClosestPoint(routePos, onRoutePoints)
-                    : getClosestPoint(routePos, unvisitedPoints)
-                if (!next) {
-                    navState = "RETURNING_TO_CAR"
+                // --- Logique rayon 200m ---
+                // Collecter tous les points isolés restants dans le rayon de marche
+                // 1. Points isolés dans le rayon du parking (priorité absolue)
+                let isolatedInRadius = getPointsInWalkRadius(parkedLocation, unvisitedPoints)
+                    .filter(function(p) { return p.isolated })
+                    .sort(function(a, b) {
+                        return getDistMeters(routePos, a) - getDistMeters(routePos, b)
+                    })
+
+                if (isolatedInRadius.length > 0) {
+                    // Des points isolés restent dans le rayon → on enchaîne
+                    currentTarget = isolatedInRadius[0]
+                    lastFootRouteCoords = null
+                    navState = "WALKING_TO_POI"
+                    lastFootPos = null
+                    footRoutePending = false.     
+                    targetJustValidated = false    // ← reset du flag
+                    updatePolygonCenterRenderer()
+                    updateArrowRenderer()
+                    showHudMessage(tr("👟 ") + isolatedInRadius.length + tr(" point(s) dans rayon 200m"), true)
                 } else {
-                    let pt = next.point
-                    let distToNext = next.distance
+                    // 2. Chercher un point non-isolé proche de la position courante
+                    //    où marcher est plus rapide que retourner en voiture
+                    let walkSpeed  = 1.2  // m/s
+                    let driveSpeed = 8.3  // m/s
                     let distToParked = getDistMeters(routePos, parkedLocation)
 
-                    if (pt.isolated) {
-                        currentTarget = pt
+                    let bestWalkTarget = null
+                    let bestWalkScore  = 1e9
+
+                    for (let w = 0; w < unvisitedPoints.length; w++) {
+                        let candidate = unvisitedPoints[w]
+                        let distToCandidate = getDistMeters(routePos, candidate)
+
+                        // Doit être dans le rayon de marche depuis la position courante
+                        if (distToCandidate > walkRadius) continue
+
+                        // Comparaison temps : marche directe vs retour voiture + conduite
+                        let timeWalk = distToCandidate / walkSpeed
+                        let driveDistEst = getDistMeters(parkedLocation, candidate) * 1.4
+                        let timeCar  = distToParked / walkSpeed + driveDistEst / driveSpeed
+
+                        if (timeWalk < timeCar && distToCandidate < bestWalkScore) {
+                            bestWalkScore  = distToCandidate
+                            bestWalkTarget = candidate
+                        }
+                    }
+
+                    if (bestWalkTarget) {
+                        let distToTarget = Math.round(getDistMeters(routePos, bestWalkTarget))
+                        currentTarget = bestWalkTarget
+                        targetJustValidated = false
+                        lastFootRouteCoords = null
                         navState = "WALKING_TO_POI"
                         updatePolygonCenterRenderer()
                         updateArrowRenderer()
-                        showHudMessage(tr("Acc��s à pied\n(point isolé)"), true)
+                        showHudMessage(tr("👟 Plus rapide à pied\n(") + distToTarget + "m)", true)
                     } else {
-                        let walkSpeed  = 1.2
-                        let driveSpeed = 8.3
-
-                        let timeWalk = distToNext / walkSpeed
-                        let driveDistEst = getDistMeters(parkedLocation, pt) * 1.4
-                        let timeCar  = distToParked / walkSpeed + driveDistEst / driveSpeed
-
-                        if (timeWalk <= timeCar) {
-                            currentTarget = pt
-                            navState = "WALKING_TO_POI"
-                            updatePolygonCenterRenderer()
-                            updateArrowRenderer()
-                            let saved = Math.round((timeCar - timeWalk) / 60)
-                            showHudMessage(tr("👟 À pied plus rapide") + "\n(~" + saved + " " + tr("min gagnées") + ")")
-                        } else {
-                            navState = "RETURNING_TO_CAR"
-                            let saved = Math.round((timeWalk - timeCar) / 60)
-                            showHudMessage(tr("🚗 Retour voiture") + "\n(~" + saved + " " + tr("min gagnées") + ")")
-                        }
+                        // Aucun point intéressant à pied → retour voiture
+                        lastFootRouteCoords = null
+                        navState = "RETURNING_TO_CAR"
+                        showHudMessage(tr("✅ Rayon terminé.\nRetour véhicule."), true)
                     }
                 }
             } else {
@@ -1422,6 +1506,7 @@ Item {
                     if (!unvisitedPoints.find(function(p) { return p.id === bestTarget.id })) return
                     currentTarget = bestTarget
                     unvisitedPoints = unvisitedPoints.map(function(p) { return p.id === bestTarget.id ? bestTarget : p })
+                    targetJustValidated = false
                     updateOnRouteRenderer()
                     updatePolygonCenterRenderer()
                     updateArrowRenderer()
@@ -1459,82 +1544,74 @@ Item {
                 lastProcessPos = null
                 lastRouteCoords = null
                 lastFootPos = null
+                lastFootRouteCoords = null
                 showHudMessage(tr("En route."))
                 updateNavigationLoop()
                 return
             }
-            if (!lastFootPos || getDistMeters(routePos, lastFootPos) > 3) {
+            clearGeometry(carRenderer)
+            if (!lastFootRouteCoords) {
                 lastFootPos = routePos
-                clearGeometry(carRenderer)
-                drawDirectLine(routePos, parkedLocation, footRenderer)
+                fetchFootRoute(routePos, parkedLocation)
+                needsRefresh = true
+            } else {
+                let distFromRoute = getDistMeters(routePos,
+                    { x: lastFootRouteCoords[0][0], y: lastFootRouteCoords[0][1] })
+                if (distFromRoute > 50) {
+                    lastFootRouteCoords = null
+                    lastFootPos = routePos
+                    fetchFootRoute(routePos, parkedLocation)
+                } else {
+                    trimFootRouteToCurrentPos(routePos)
+                }
                 needsRefresh = true
             }
         } 
         // --- DANS updateNavigationLoop, section WALKING_TO_POI ---
-else if (navState === "WALKING_TO_POI") {
-    if (!currentTarget) return
+        else if (navState === "WALKING_TO_POI") {
+            if (!currentTarget) return
 
-    // --- OPTIMISATION : vérifier accès route alternatif si trop loin de la voiture ---
-    let distFromCar = parkedLocation ? getDistMeters(parkedLocation, currentTarget) : 0
+            // GARDE-FOU PRINCIPAL : jamais plus de walkRadius mètres du parking
+            if (parkedLocation) {
+                let distFromCar = getDistMeters(parkedLocation, currentTarget)
 
-    if (parkedLocation && distFromCar > 300 && !currentTarget.altChecked) {
-        // Marquer immédiatement pour éviter les appels répétés à chaque tick
-        let markedTarget = {
-            id:         currentTarget.id,
-            x:          currentTarget.x,
-            y:          currentTarget.y,
-            onRoute:    currentTarget.onRoute,
-            isolated:   currentTarget.isolated,
-            altChecked: true
-        }
-        currentTarget = markedTarget
-        unvisitedPoints = unvisitedPoints.map(function(p) {
-            return p.id === markedTarget.id ? markedTarget : p
-        })
-
-        let snapTarget = markedTarget
-        checkAlternativeFootAccess(markedTarget, distFromCar, function(bestRoadDist, bestVert) {
-            // Vérifier qu'on est toujours en train de marcher vers ce même point
-            if (navState !== "WALKING_TO_POI") return
-            if (!currentTarget || currentTarget.id !== snapTarget.id) return
-
-            // Gain significatif (>100m de marche en moins) via une autre route ?
-            if (bestVert && bestRoadDist < distFromCar - 100) {
-                let gain = Math.round(distFromCar - bestRoadDist)
-                showHudMessage(tr("🔄 Retour voiture :\naccès route plus court(-") + gain + "m)", true)
-
-                // Mettre à jour le point avec le sommet le plus proche de la route
-                let updatedPt = {
-                    id:         snapTarget.id,
-                    x:          bestVert.x,
-                    y:          bestVert.y,
-                    onRoute:    bestRoadDist < 50,
-                    isolated:   bestRoadDist > 200,
-                    altChecked: true          // Ne plus re-vérifier
+                if (distFromCar > walkRadius) {
+                    // Hors rayon → retour voiture immédiat, pas d'exception
+                    lastFootRouteCoords = null
+                    navState = "RETURNING_TO_CAR"
+                    showHudMessage(tr("🚗 Hors rayon 200m.\nRetour véhicule."), true)
+                    return
                 }
-                unvisitedPoints = unvisitedPoints.map(function(p) {
-                    return p.id === updatedPt.id ? updatedPt : p
-                })
 
-                currentTarget = null
-                navState = "RETURNING_TO_CAR"
-                updatePolygonCenterRenderer()
-                updateArrowRenderer()
+                // Point accessible en voiture dans le rayon → retour voiture
+                if (!currentTarget.isolated && currentTarget.onRoute) {
+                    lastFootRouteCoords = null
+                    navState = "RETURNING_TO_CAR"
+                    showHudMessage(tr("🚗 Point route dans rayon.\nRetour véhicule."), true)
+                    return
+                }
             }
-            // Sinon : pas d'alternative meilleure → on continue à pied, altChecked évite la re-vérif
-        })
-    }
 
-    // Si l'async vient de changer l'état, on ne redessine pas
-    if (navState !== "WALKING_TO_POI") return
-
-    if (!lastFootPos || getDistMeters(routePos, lastFootPos) > 3) {
-        lastFootPos = routePos
-        clearGeometry(carRenderer)
-        drawDirectLine(routePos, currentTarget, footRenderer)
-        needsRefresh = true
-    }
-}
+            // Route piétonne : calcul unique + trim progressif
+            clearGeometry(carRenderer)
+            if (!lastFootRouteCoords) {
+                lastFootPos = routePos
+                fetchFootRoute(routePos, currentTarget)
+                needsRefresh = true
+            } else {
+                let distFromRoute = getDistMeters(routePos,
+                    { x: lastFootRouteCoords[0][0], y: lastFootRouteCoords[0][1] })
+                if (distFromRoute > 50) {
+                    // Déviation trop grande → recalcul
+                    lastFootRouteCoords = null
+                    lastFootPos = routePos
+                    fetchFootRoute(routePos, currentTarget)
+                } else {
+                    trimFootRouteToCurrentPos(routePos)
+                }
+                needsRefresh = true
+            }
+        }
         else if (navState === "DRIVING") {
             if (!currentTarget) return
             if (lastRouteCoords && lastRouteCoords.length >= 2) {
@@ -1596,6 +1673,7 @@ else if (navState === "WALKING_TO_POI") {
                 for (let k = 0; k < json.length && k < allVerts.length; k++) {
                     let entry = json[k]
                     let roadDist = 1e9 // Distance entre le point et la route
+                    let roadSpeed = 50  // vitesse par défaut urbaine
                     if (entry && entry.edges && entry.edges.length > 0) {
                         let edge = entry.edges[0]
                         if (edge.correlated_lat !== undefined && edge.correlated_lon !== undefined) {
@@ -1604,10 +1682,20 @@ else if (navState === "WALKING_TO_POI") {
                                 { x: edge.correlated_lon, y: edge.correlated_lat }
                             )
                         }
+                        // Récupérer la vitesse de la route snappée
+                        if (edge.speed !== undefined) {
+                            roadSpeed = edge.speed
+                        } else if (edge.road_class !== undefined) {
+                            let rc = edge.road_class
+                            if (rc === "motorway")       roadSpeed = 130
+                            else if (rc === "trunk")     roadSpeed = 110
+                            else if (rc === "primary")   roadSpeed = 90
+                            else                         roadSpeed = 50
+                        }
                     }
                     let ptId = allVerts[k].ptId
                     if (!bestPerPt[ptId] || roadDist < bestPerPt[ptId].roadDist) {
-                        bestPerPt[ptId] = { vert: allVerts[k].vert, roadDist: roadDist }
+                        bestPerPt[ptId] = { vert: allVerts[k].vert, roadDist: roadDist, roadSpeed: roadSpeed }
                     }
                 }
 
@@ -1633,7 +1721,16 @@ else if (navState === "WALKING_TO_POI") {
                         roadPenalty = b.roadDist * 5 // On multiplie par 5 la distance de marche pour décourager
                     }
 
-                    let currentScore = distToMe + roadPenalty
+                    // Pénalité voie rapide > 90km/h
+                    let speedPenalty = 0
+                    let speed = b.roadSpeed || 50
+                    if (speed > 110) {
+                        speedPenalty = 100000  // autoroute/voie express → quasi-exclusion
+                    } else if (speed > 90) {
+                        speedPenalty = 5000    // route nationale rapide → forte pénalité
+                    }
+
+                    let currentScore = distToMe + roadPenalty + speedPenalty
 
                     if (currentScore < bestScore) {
                         bestScore = currentScore
@@ -1705,6 +1802,122 @@ else if (navState === "WALKING_TO_POI") {
     req.setRequestHeader("Content-Type", "application/json")
     req.send(body)
 }
+
+    // --- Retourne tous les points dans le rayon de marche depuis parkPos ---
+    function getPointsInWalkRadius(parkPos, points) {
+        if (!parkPos || !points) return []
+        return points.filter(function(p) {
+            return getDistMeters(parkPos, p) <= walkRadius
+        })
+    }
+
+    // --- Routage piéton Valhalla (calcul unique, fallback ligne droite) ---
+    function valhallaFootRequest(start, end, callback) {
+        let straightDist = getDistMeters(start, end)
+        let url = "https://valhalla1.openstreetmap.de/route"
+        let body = JSON.stringify({
+            locations: [
+                { lon: start.x, lat: start.y, type: "break" },
+                { lon: end.x,   lat: end.y,   type: "break" }
+            ],
+            costing: "pedestrian",
+            costing_options: {
+                pedestrian: {
+                    use_ferry:          0.0,
+                    use_living_streets: 1.0,
+                    use_tracks:         1.0,
+                    use_hills:          0.5,
+                    service_penalty:    0.0,
+                    walkway_factor:     0.8
+                }
+            },
+            directions_options: { units: "kilometers" }
+        })
+        var req = new XMLHttpRequest()
+        req.timeout = 5000
+        req.ontimeout = function() { callback(null) }
+        req.onerror   = function() { callback(null) }
+        req.onreadystatechange = function() {
+            if (req.readyState !== XMLHttpRequest.DONE) return
+            if (req.status === 200) {
+                try {
+                    let json = JSON.parse(req.responseText)
+                    if (json.trip && json.trip.legs && json.trip.legs.length > 0) {
+                        let coords = decodePolyline6(json.trip.legs[0].shape)
+                        if (coords && coords.length >= 2) {
+                            // Rejeter les détours absurdes (> 4× la distance directe)
+                            let routeDist = 0
+                            for (let i = 0; i < coords.length - 1; i++) {
+                                routeDist += getDistMeters(
+                                    { x: coords[i][0],   y: coords[i][1] },
+                                    { x: coords[i+1][0], y: coords[i+1][1] }
+                                )
+                            }
+                            if (routeDist <= straightDist * 4) {
+                                callback(coords); return
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
+            callback(null) // fallback ligne droite
+        }
+        req.open("POST", url)
+        req.setRequestHeader("Content-Type", "application/json")
+        req.send(body)
+    }
+
+    // --- Calcule la route pied UNE SEULE FOIS et la stocke dans lastFootRouteCoords ---
+    function fetchFootRoute(start, end) {
+        // Affichage immédiat en attendant Valhalla
+        drawDirectLine(start, end, footRenderer)
+        clearGeometry(carRenderer)
+        mapCanvas.refresh()
+        valhallaFootRequest(start, end, function(coords) {
+            if (navState !== "WALKING_TO_POI" && navState !== "RETURNING_TO_CAR") return
+            if (coords && coords.length >= 2) {
+                // Si le 2ème point s'éloigne de la cible → chemin part en arrière → ligne droite
+                let distStartToEnd = getDistMeters(start, end)
+                let secondPt = { x: coords[1][0], y: coords[1][1] }
+                let distSecondToEnd = getDistMeters(secondPt, end)
+                if (distSecondToEnd > distStartToEnd + 15) {
+                    lastFootRouteCoords = null
+                    drawDirectLine(start, end, footRenderer)
+                    mapCanvas.refresh()
+                    return
+                }
+                // Forcer le départ exact depuis la position réelle (pas le snap Valhalla)
+                coords[0] = [start.x, start.y]
+                // Forcer l'arrivée exacte sur la cible si gap > 5m
+                let snapEnd = { x: coords[coords.length-1][0], y: coords[coords.length-1][1] }
+                if (getDistMeters(snapEnd, end) > 5) {
+                    coords = coords.concat([[end.x, end.y]])
+                }
+                lastFootRouteCoords = coords
+                drawLineFromCoords(coords, footRenderer)
+            } else {
+                lastFootRouteCoords = null
+                drawDirectLine(start, end, footRenderer)
+            }
+            mapCanvas.refresh()
+        })
+    }
+
+    // --- Découpe la route pied au fur et à mesure de la progression ---
+    function trimFootRouteToCurrentPos(pos) {
+        if (!lastFootRouteCoords || lastFootRouteCoords.length < 2) return false
+        let minDist = 1e9
+        let closestIdx = 0
+        for (let i = 0; i < lastFootRouteCoords.length; i++) {
+            let d = getDistMeters(pos, { x: lastFootRouteCoords[i][0], y: lastFootRouteCoords[i][1] })
+            if (d < minDist) { minDist = d; closestIdx = i }
+        }
+        if (closestIdx === 0) return false
+        lastFootRouteCoords = lastFootRouteCoords.slice(closestIdx)
+        if (lastFootRouteCoords.length >= 2)
+            drawLineFromCoords(lastFootRouteCoords, footRenderer)
+        return true
+    }
 
     // --- 9. ROUTAGE VALHALLA ---
     function fetchOsrmRoute(start, end) {
@@ -1814,6 +2027,7 @@ else if (navState === "WALKING_TO_POI") {
                 parkedLocation = snap
                 navState = "WALKING_TO_POI"
                 lastFootPos = null
+                lastFootRouteCoords = null
                 updatePolygonCenterRenderer()
                 updateArrowRenderer()
                 showHudMessage(tr("Fin de route.\nFinir à pied."), true)
@@ -1927,20 +2141,32 @@ else if (navState === "WALKING_TO_POI") {
     }
 
     function shouldParkHere(myPos, remainingPts) {
-    if (!remainingPts || remainingPts.length === 0) return false
-    let next = getClosestPoint(myPos, remainingPts)
-    let pt = next.point
-    
-    // Ne pas stationner si le point le plus proche est à plus de 400m 
-    // alors qu'on est encore en voiture
-    if (next.distance > 400 && navState === "DRIVING") return false;
-    
-    if (pt.isolated) return true
-    return false
-}
+        if (!remainingPts || remainingPts.length === 0) return false
+
+        // Ne se garer que s'il existe au moins un point isolé dans le rayon de marche
+        let inRadius = getPointsInWalkRadius(myPos, remainingPts)
+        if (inRadius.length === 0) return false
+
+        // S'il reste des points accessibles en voiture dans le rayon → pas besoin de se garer
+        let hasCarAccess = inRadius.find(function(p) { return !p.isolated })
+        if (hasCarAccess) return false
+
+        // Tous les points du rayon sont isolés → on se gare
+        return true
+    }
 
     // --- Rendu fuschia ---
     function updatePolygonCenterRenderer() {
+        // Si une cible vient d'être validée, couper brièvement le renderer
+        // pour forcer le redémarrage de l'animation sur la nouvelle géométrie
+        if (targetJustValidated) {
+            let empty = GeometryUtils.createGeometryFromWkt("LINESTRING(0 0, 0.000001 0.000001)")
+            if (empty) polygonCenterRenderer.geometryWrapper.qgsGeometry = empty
+            targetJustValidated = false
+            // Relancer après un bref délai pour que l'animation reparte du début
+            resetPolygonTimer.restart()
+            return
+        }
         let empty = GeometryUtils.createGeometryFromWkt("LINESTRING(0 0, 0.000001 0.000001)")
         let candidates = unvisitedPoints.filter(function(p) { return p.onRoute })
         if (navState === "WALKING_TO_POI" && currentTarget &&
@@ -2022,6 +2248,7 @@ else if (navState === "WALKING_TO_POI") {
                 currentTarget = pickBestVertex(currentTarget)
                 navState = "WALKING_TO_POI"
                 routeHasFootSegment = false
+                lastFootRouteCoords = null
                 updatePolygonCenterRenderer()
                 updateArrowRenderer()
                 showHudMessage(tr("Voiture stationnée.\nFinir à pied."), true)
